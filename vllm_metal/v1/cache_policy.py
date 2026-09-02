@@ -228,6 +228,9 @@ class _PagedAttentionPlan:
     hybrid_gdn_reservation: _HybridGDNReservation
     kv_budget: int
     num_blocks: int
+    # KV offloading host pool. Pageable, but the same physical RAM as the
+    # wired cache on unified memory, so it comes out of the same budget.
+    kv_offload_pool: int = 0
 
     def format_breakdown(self) -> str:
         parts = [
@@ -241,6 +244,8 @@ class _PagedAttentionPlan:
             parts.append(f"kv_budget_before_hybrid={self.base_kv_budget / 1e9:.2f}GB")
         if self.hybrid_gdn_reservation.is_hybrid:
             parts.append(self._hybrid_gdn_detail())
+        if self.kv_offload_pool:
+            parts.append(f"kv_offload_pool={self.kv_offload_pool / 1e9:.2f}GB")
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
 
@@ -249,6 +254,8 @@ class _PagedAttentionPlan:
             "increase VLLM_METAL_MEMORY_FRACTION",
             "use a smaller or more quantized model",
         ]
+        if self.kv_offload_pool:
+            mitigations.insert(0, "lower --kv-offloading-size")
         reservation = self.hybrid_gdn_reservation
         if reservation.enabled and reservation.max_num_seqs > 1:
             seq_mitigation = (
@@ -1306,7 +1313,13 @@ class WorkerCachePlanner:
         )
         reservation = self._hybrid_gdn_reservation()
         draft_scratch_bytes = self._worker.model_runner.draft_scratch_reserve_bytes()
-        kv_budget = base_kv_budget - reservation.total_bytes - draft_scratch_bytes
+        kv_offload_pool = self._kv_offload_pool_bytes()
+        kv_budget = (
+            base_kv_budget
+            - reservation.total_bytes
+            - draft_scratch_bytes
+            - kv_offload_pool
+        )
         plan = _PagedAttentionPlan(
             block_size=block_size,
             fraction=fraction,
@@ -1319,12 +1332,31 @@ class WorkerCachePlanner:
             hybrid_gdn_reservation=reservation,
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
+            kv_offload_pool=kv_offload_pool,
         )
         self._validate_paged_attention_plan(
             plan,
             require_min_blocks=require_min_blocks,
         )
         return plan
+
+    def _kv_offload_pool_bytes(self) -> int:
+        """Host pool bytes of a configured KV offloading connector, else 0.
+
+        On unified memory the pool is the same physical RAM as the wired
+        cache. Leaving it outside the budget lets ``--kv-offloading-size``
+        push the resident set past what VLLM_METAL_MEMORY_FRACTION promised,
+        and the pool is pageable, so that swaps instead of failing at start.
+        The platform hook has already translated the size into
+        ``cpu_bytes_to_use`` by the time the plan runs.
+        """
+        kv_transfer_config = getattr(
+            self._worker.vllm_config, "kv_transfer_config", None
+        )
+        if kv_transfer_config is None or not kv_transfer_config.kv_connector:
+            return 0
+        extra = kv_transfer_config.kv_connector_extra_config or {}
+        return max(0, int(extra.get("cpu_bytes_to_use", 0)))
 
     def _validate_paged_attention_plan(
         self, plan: _PagedAttentionPlan, *, require_min_blocks: bool

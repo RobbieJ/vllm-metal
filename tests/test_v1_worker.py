@@ -17,6 +17,7 @@ from vllm_metal.attention.runtime.families.gdn import build_gdn_hybrid_plan
 from vllm_metal.config import AUTO_MEMORY_FRACTION, MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.v1 import model_runner as mr  # noqa: E402
+from vllm_metal.v1 import worker as worker_mod  # noqa: E402
 from vllm_metal.v1.cache_policy import (  # noqa: E402
     ModelCachePolicy,
     WorkerCachePlanner,
@@ -351,6 +352,61 @@ class TestPagedAttentionPlanDiagnostics:
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
 
+    def _plain_runner(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            is_hybrid=False,
+            scheduler_memory_reporting_mode=MagicMock(
+                return_value="paged_attention_capacity"
+            ),
+            profile_run=MagicMock(return_value=1_000_000_000),
+            validate_paged_attention_support=MagicMock(),
+            scheduler_config=SimpleNamespace(max_num_seqs=2),
+            cache_config=SimpleNamespace(mamba_cache_mode="none"),
+            draft_scratch_reserve_bytes=MagicMock(return_value=0),
+        )
+
+    def test_kv_offload_pool_comes_out_of_the_metal_budget(self, monkeypatch) -> None:
+        """The host pool is the same physical RAM as the wired cache, so the
+        memory fraction must bound both together. Without this the pool sits
+        on top of the budget and a large --kv-offloading-size swaps."""
+        monkeypatch.setattr(
+            WorkerCachePlanner, "_metal_limit_bytes", lambda self: 10_000_000_000
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner, "get_model_memory_usage", lambda self: 1_000_000_000
+        )
+
+        def plan_with(kv_transfer_config):
+            worker = _make_worker(self._plain_runner(), use_paged_attention=True)
+            worker.metal_config.memory_fraction = 0.5
+            worker.get_cache_block_size_bytes = MagicMock(return_value=1_000_000)
+            worker.vllm_config.kv_transfer_config = kv_transfer_config
+            return WorkerCachePlanner(worker)._paged_attention_plan(
+                overhead=1_000_000_000
+            )
+
+        without = plan_with(None)
+        pool = 2_000_000_000
+        with_pool = plan_with(
+            SimpleNamespace(
+                kv_connector="MetalOffloadingConnector",
+                kv_connector_extra_config={"cpu_bytes_to_use": pool},
+            )
+        )
+        assert with_pool.kv_budget == without.kv_budget - pool
+        assert with_pool.num_blocks == without.num_blocks - pool // 1_000_000
+        assert "kv_offload_pool=2.00GB" in with_pool.format_breakdown()
+        assert "lower --kv-offloading-size" in with_pool.format_mitigations()
+
+        # A transfer config with no connector is inert and must not budget.
+        inert = plan_with(
+            SimpleNamespace(
+                kv_connector=None,
+                kv_connector_extra_config={"cpu_bytes_to_use": pool},
+            )
+        )
+        assert inert.kv_budget == without.kv_budget
+
     def test_hybrid_oom_error_reports_lazy_gdn_state(self, monkeypatch) -> None:
         runner = SimpleNamespace(
             is_hybrid=True,
@@ -604,3 +660,66 @@ class TestHybridPlanGuard:
 
         with pytest.raises(RuntimeError, match="no resolved hybrid_runtime_plan"):
             runner.linear_cache_bytes_per_slot()
+
+
+class TestShutdownClosesConnectorStep:
+    """The connector step must end before the transfer group is torn down."""
+
+    def test_step_closes_before_kv_transfer_shutdown(self, monkeypatch) -> None:
+        order: list[str] = []
+        model_runner = SimpleNamespace(
+            finish_kv_connector_step=lambda: order.append("close"),
+        )
+        worker = _make_worker(model_runner, use_paged_attention=True)
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: order.append("shutdown")
+        )
+
+        MetalWorker.shutdown(worker)
+
+        assert order == ["close", "shutdown"]
+
+    def test_shutdown_survives_a_runner_without_the_hook(self, monkeypatch) -> None:
+        """STT runners have no connector step; shutdown must not care."""
+        calls: list[str] = []
+        worker = _make_worker(SimpleNamespace(), use_paged_attention=True)
+        worker._metal_profiler = None
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_shutdown", lambda: calls.append("shutdown")
+        )
+
+        MetalWorker.shutdown(worker)
+
+        assert calls == ["shutdown"]
+
+
+class TestOffloadGuardsGateOnAConnector:
+    """validate_metal_support rejects shapes the offload path cannot serve.
+    It must run only when a connector is configured: a transfer config with
+    no connector is inert upstream, and hybrid models never asked for
+    offloading."""
+
+    def _run(self, monkeypatch, kv_transfer_config) -> list[str]:
+        calls: list[str] = []
+        monkeypatch.setattr(
+            "vllm_metal.v1.kv_offload.spec.validate_metal_support",
+            lambda _cfg: calls.append("validate"),
+        )
+        monkeypatch.setattr(
+            worker_mod, "ensure_kv_transfer_initialized", lambda *_: None
+        )
+        monkeypatch.setattr(worker_mod, "has_kv_transfer_group", lambda: False)
+        runner = SimpleNamespace(initialize_kv_cache=lambda _cfg: calls.append("init"))
+        worker = _make_worker(runner, use_paged_attention=True)
+        worker.vllm_config.kv_transfer_config = kv_transfer_config
+        MetalWorker.initialize_from_config(worker, SimpleNamespace())
+        return calls
+
+    def test_inert_transfer_config_skips_the_guard(self, monkeypatch) -> None:
+        inert = SimpleNamespace(kv_connector=None)
+        assert self._run(monkeypatch, inert) == ["init"]
+
+    def test_connector_runs_the_guard_first(self, monkeypatch) -> None:
+        configured = SimpleNamespace(kv_connector="MetalOffloadingConnector")
+        assert self._run(monkeypatch, configured) == ["validate", "init"]
