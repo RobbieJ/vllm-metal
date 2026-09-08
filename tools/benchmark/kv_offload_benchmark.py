@@ -188,11 +188,14 @@ class ServerProcess:
         offload: bool,
         store_dir: Path | None,
         log_path: Path,
+        fraction: float | None = None,
     ) -> None:
         self.args = args
         self.offload = offload
         self.store_dir = store_dir
         self.log_path = log_path
+        # Explicit memory fraction, overriding the arm-based choice in _env.
+        self.fraction = fraction
         self.port = free_port()
         self.proc: subprocess.Popen | None = None
         self.max_tokens_cached = 0
@@ -237,6 +240,8 @@ class ServerProcess:
         fraction = self.args.memory_fraction
         if not self.offload and self.args.baseline_memory_fraction:
             fraction = self.args.baseline_memory_fraction
+        if self.fraction is not None:
+            fraction = self.fraction
         env["VLLM_METAL_MEMORY_FRACTION"] = str(fraction)
         # Block filenames are content hashes and hash seeding is per process.
         # Without this a restarted server cannot find what the previous one
@@ -366,12 +371,40 @@ def affordable_spill(
     return 1.4, None
 
 
+def affordable_no_reuse(
+    args: argparse.Namespace, bytes_per_token: float
+) -> tuple[int, str | None]:
+    """How many distinct prompts the disk can take.
+
+    The no-reuse workload writes every evicted block and reads none back, so
+    its store is close to the whole working set less the host pool. On a 32B
+    model with 96 prompts that was 84 GB. Scale the prompt count down to fit
+    rather than filling the disk on a control.
+    """
+    if not bytes_per_token:
+        return args.num_prompts, None
+    per_request = args.prefix_len + args.suffix_len
+    free_gb = shutil.disk_usage(work_root()).free / (1 << 30) - DISK_HEADROOM_GB
+    budget_bytes = max(free_gb, 0.0) * (1 << 30) + args.offload_size_gib * (1 << 30)
+    max_prompts = int(budget_bytes / (per_request * bytes_per_token))
+    if max_prompts >= args.num_prompts:
+        return args.num_prompts, None
+    prompts = max(8, max_prompts)
+    return prompts, (
+        f"disk allows ~{max_prompts} distinct prompts, not {args.num_prompts}; "
+        f"the no-reuse workload runs {prompts}"
+    )
+
+
 def workloads(
     args: argparse.Namespace, kv_tokens: int, bytes_per_token: float = 0.0
 ) -> dict[str, dict]:
     """Prompt sets, with the spilling one sized off the real KV cache."""
     per_request = args.prefix_len + args.suffix_len
     multiple, note = affordable_spill(args, kv_tokens, bytes_per_token)
+    if note:
+        print(f"NOTE: {note}", file=sys.stderr)
+    no_reuse_prompts, note = affordable_no_reuse(args, bytes_per_token)
     if note:
         print(f"NOTE: {note}", file=sys.stderr)
     # Comfortably over the cache, without so much churn that the run is
@@ -381,7 +414,11 @@ def workloads(
     # repetition to cache. vllm bench serve also rejects num_prefixes >
     # num_requests outright.
     per_prefix = 3
-    spill_prompts = max(args.num_prompts, spill_prefixes * 2)
+    # Exactly two per prefix, never more. prefix_repetition emits a prefix's
+    # requests consecutively, so in the measured pass only the first is a
+    # restore or a recompute and the rest are warm hits. More than two per
+    # prefix lets warm hits become the median and hides a working tier.
+    spill_prompts = spill_prefixes * 2
     # The fits workload only has to stay inside the cache, not fill it. A
     # model with a large KV cache would otherwise derive hundreds of
     # prefixes and need thousands of prompts to serve them.
@@ -405,7 +442,7 @@ def workloads(
                 "--dataset-name",
                 "random",
                 "--num-prompts",
-                str(args.num_prompts),
+                str(no_reuse_prompts),
                 "--random-input-len",
                 str(per_request),
                 "--random-output-len",
@@ -440,7 +477,7 @@ def workloads(
                 "--dataset-name",
                 "prefix_repetition",
                 "--num-prompts",
-                str(max(args.num_prompts, spill_prefixes * 2)),
+                str(spill_prompts),
                 "--prefix-repetition-num-prefixes",
                 str(spill_prefixes),
                 *prefix_args,
@@ -527,7 +564,13 @@ def one_sample(
 
 
 def discover_kv_geometry(args: argparse.Namespace, work_dir: Path) -> tuple[int, float]:
-    with ServerProcess(args, False, None, work_dir / "probe.log") as srv:
+    # Probe at the treatment fraction, not the baseline's. With
+    # --baseline-memory-fraction the baseline cache is the larger one, and a
+    # control sized to it would overflow the treatment cache, which turns a
+    # control into a workload offloading can help.
+    with ServerProcess(
+        args, False, None, work_dir / "probe.log", fraction=args.memory_fraction
+    ) as srv:
         if not srv.max_tokens_cached:
             raise RuntimeError(
                 "could not read max_tokens_cached from the server log; pass "
@@ -650,6 +693,14 @@ def main(argv: list[str] | None = None) -> int:
         print("probing KV cache capacity...", flush=True)
         kv_tokens, bytes_per_token = discover_kv_geometry(args, work_dir)
     print(f"KV cache holds {kv_tokens} tokens", flush=True)
+    if not bytes_per_token:
+        print(
+            "WARNING: --kv-cache-tokens skips the probe, so bytes per token "
+            "are unknown and the disk budget cannot be estimated. The "
+            "spilling workload runs at 1.4x the cache and the no-reuse "
+            "workload at full size; make sure the disk has room.",
+            file=sys.stderr,
+        )
 
     if args.offload_size_gib <= 0:
         if not bytes_per_token:
@@ -765,7 +816,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     print(f"\nwrote {out_path}")
-    return 1 if suspect else 0
+    # A failed sample leaves a hole in the JSON. Automation must not read
+    # that as a clean run.
+    return 1 if suspect or record["failures"] else 0
 
 
 if __name__ == "__main__":
