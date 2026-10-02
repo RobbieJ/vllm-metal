@@ -218,6 +218,26 @@ class TestMLAKernelBlockSizes:
         start = src.index(signature)
         return src[start : src.index("\n}\n", start)]
 
+    def _gate_rows(self) -> set[tuple[int, int, int, int, int, int]]:
+        """The (kvr, pe, bs, g, nt, ps) rows of the shared spec table.
+
+        ``kMlaKernelSpecs`` in paged_ops.cpp is the single source of truth
+        the dispatch gate validates against — one ``{kvr, pe, bs, g, nt,
+        ps}`` row per instantiated shape.
+        """
+        cpp = self._PAGED_OPS.read_text()
+        table = cpp[cpp.index("kMlaKernelSpecs") :]
+        rows = {
+            tuple(int(v) for v in m.groups())
+            for m in re.finditer(
+                r"\{\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,"
+                r"\s*(\d+)\s*,\s*(\d+)\s*\}",
+                table[: table.index("};")],
+            )
+        }
+        assert rows, "could not parse the kMlaKernelSpecs table"
+        return rows
+
     def test_matches_mla_metal_instantiations(self):
         instantiated = {bs for _, _, _, bs, _, _, _ in self._instantiations()}
         assert instantiated == set(MLA_KERNEL_BLOCK_SIZES)
@@ -225,26 +245,14 @@ class TestMLAKernelBlockSizes:
     def test_instantiations_match_the_cpp_dispatch_gate(self):
         """Every instantiated specialization must be dispatchable.
 
-        ``dispatch_mla_paged_attention`` rejects any (kv_lora_rank,
-        qk_rope_head_dim, block_size, heads_per_tg, partition_size, dtype)
-        outside its gate; an instantiation beyond the gate compiles dead
-        binary and a gate value without an instantiation throws at runtime.
-        The call sites must be exactly the gate's admitted space.
+        ``dispatch_mla_paged_attention`` admits only the
+        (kv_lora_rank, qk_rope_head_dim, block_size, heads_per_tg,
+        num_threads, partition_size) rows in ``kMlaKernelSpecs``; an
+        instantiation beyond the table compiles dead binary and a table
+        row without an instantiation throws at runtime. The call sites
+        must be exactly the table's admitted space.
         """
         cpp = self._PAGED_OPS.read_text()
-        dispatch = self._fn_body(cpp, "static void dispatch_mla_paged_attention")
-        kv_lora_ranks = {int(v) for v in re.findall(r"kv_lora_rank != (\d+)", dispatch)}
-        rope_dims = {int(v) for v in re.findall(r"qk_rope_head_dim != (\d+)", dispatch)}
-        block_sizes = {int(v) for v in re.findall(r"block_size != (\d+)", dispatch)}
-        partitions = {int(v) for v in re.findall(r"_nsl32_ps(\d+)", dispatch)}
-
-        g_to_threads = {
-            int(g): int(nt)
-            for g, nt in re.findall(
-                r"case (\d+):\s*return (\d+);",
-                self._fn_body(cpp, "static int mla_num_threads_for_g"),
-            )
-        }
 
         # mla_validate_t_dtypes admits only fp16/bf16 for the T buffers; map
         # them through dtype_to_metal to the instantiated type names.
@@ -261,40 +269,16 @@ class TestMLAKernelBlockSizes:
                 self._fn_body(cpp, "static void mla_validate_t_dtypes"),
             )
         }
+        assert gate_dtypes, "could not parse the C++ dtype gate"
 
-        for name, parsed in (
-            ("kv_lora_rank", kv_lora_ranks),
-            ("qk_rope_head_dim", rope_dims),
-            ("block_size", block_sizes),
-            ("partition_size", partitions),
-            ("heads_per_tg map", g_to_threads),
-            ("dtype gate", gate_dtypes),
-        ):
-            assert parsed, f"could not parse the C++ {name} gate"
-
-        expected = {
-            (t, kvr, pe, bs, g, nt, ps)
-            for t in gate_dtypes
-            for kvr in kv_lora_ranks
-            for pe in rope_dims
-            for bs in block_sizes
-            for g, nt in g_to_threads.items()
-            for ps in partitions
-        }
+        expected = {(t, *row) for t in gate_dtypes for row in self._gate_rows()}
         assert self._instantiations() == expected
 
     def test_python_g_picker_stays_inside_the_gate(self):
         """_pick_heads_per_tg may only return G values the gate maps."""
         from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
 
-        cpp = self._PAGED_OPS.read_text()
-        admitted = {
-            int(g)
-            for g, _ in re.findall(
-                r"case (\d+):\s*return (\d+);",
-                self._fn_body(cpp, "static int mla_num_threads_for_g"),
-            )
-        }
+        admitted = {g for _, _, _, g, _, _ in self._gate_rows()}
         picked = {
             MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch)
             for num_heads in range(1, 65)

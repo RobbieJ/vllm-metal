@@ -1730,18 +1730,30 @@ void init_mla_library(const std::string& src) {
 //   5: latent_cache [num_blocks, BLOCK_SIZE, KV_LORA_RANK + QK_ROPE_HEAD_DIM]
 //   6: block_tables 7: context_lens 8: cu_seqlens_q
 //   9: num_seqs 10: max_num_blocks_per_seq 11: scale
-// Map heads_per_tg → NUM_THREADS. Each variant keeps the per-thread register
-// footprint roughly constant (NUM_THREADS scaled inversely to G).
+// The instantiated MLA specialization space — one row per distinct shape the
+// instantiate_mla call sites in kernels_v2/mla.metal declare. The dispatch
+// gate below and the drift test in tests/test_block_size_translation.py both
+// read this one table, so keep the row format stable:
+//   {kv_lora_rank, qk_rope_head_dim, block_size, heads_per_tg, num_threads,
+//    partition_size}
+// Each variant keeps the per-thread register footprint roughly constant
+// (NUM_THREADS scaled inversely to G):
 //   G=1 → NUM_THREADS=1024 (32 simdgroups, current sdpa_vector layout).
 //   G=2 → NUM_THREADS=512  (16 simdgroups, 2× cross-head amortization).
-// Returns 0 for an unsupported G so callers can validate.
-static int mla_num_threads_for_g(int heads_per_tg) {
-  switch (heads_per_tg) {
-    case 1: return 1024;
-    case 2: return 512;
-    default: return 0;
-  }
-}
+struct MlaKernelSpec {
+  int kv_lora_rank;
+  int qk_rope_head_dim;
+  int block_size;
+  int heads_per_tg;
+  int num_threads;
+  int partition_size;
+};
+static constexpr MlaKernelSpec kMlaKernelSpecs[] = {
+    {512, 64, 16, 1, 1024, 0},
+    {512, 64, 32, 1, 1024, 0},
+    {512, 64, 16, 2, 512, 0},
+    {512, 64, 32, 2, 512, 0},
+};
 
 static void dispatch_mla_paged_attention(
     array& out,
@@ -1764,26 +1776,25 @@ static void dispatch_mla_paged_attention(
   int max_num_blocks_per_seq = static_cast<int>(block_tables.shape(1));
   int num_seqs = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
 
-  // Shape sanity — these must match what the kernel template was instantiated for.
-  if (kv_lora_rank != 512) {
-    throw std::runtime_error(
-        "MLA kernel: only kv_lora_rank=512 is instantiated; got " +
-        std::to_string(kv_lora_rank));
+  // The shape must match a kernel template instantiation — see
+  // kMlaKernelSpecs for the admitted space.
+  const MlaKernelSpec* spec = nullptr;
+  for (const auto& candidate : kMlaKernelSpecs) {
+    if (candidate.kv_lora_rank == kv_lora_rank &&
+        candidate.qk_rope_head_dim == qk_rope_head_dim &&
+        candidate.block_size == block_size &&
+        candidate.heads_per_tg == heads_per_tg &&
+        candidate.partition_size == 0) {
+      spec = &candidate;
+      break;
+    }
   }
-  if (qk_rope_head_dim != 64) {
+  if (spec == nullptr) {
     throw std::runtime_error(
-        "MLA kernel: only qk_rope_head_dim=64 is instantiated; got " +
-        std::to_string(qk_rope_head_dim));
-  }
-  if (block_size != 16 && block_size != 32) {
-    throw std::runtime_error(
-        "MLA kernel: only block_size in {16, 32} is instantiated; got " +
-        std::to_string(block_size));
-  }
-  int num_threads = mla_num_threads_for_g(heads_per_tg);
-  if (num_threads == 0) {
-    throw std::runtime_error(
-        "MLA kernel: heads_per_tg must be in {1, 2}; got " +
+        "MLA kernel: no instantiation for kv_lora_rank=" +
+        std::to_string(kv_lora_rank) + " qk_rope_head_dim=" +
+        std::to_string(qk_rope_head_dim) + " block_size=" +
+        std::to_string(block_size) + " heads_per_tg=" +
         std::to_string(heads_per_tg));
   }
   if (num_heads % heads_per_tg != 0) {
@@ -1801,11 +1812,12 @@ static void dispatch_mla_paged_attention(
 
   auto dt = dtype_to_metal(q_nope.dtype());
   std::string kname = "paged_mla_attention_" + dt + "_kvr" +
-                      std::to_string(kv_lora_rank) + "_pe" +
-                      std::to_string(qk_rope_head_dim) + "_bs" +
-                      std::to_string(block_size) + "_g" +
-                      std::to_string(heads_per_tg) + "_nt" +
-                      std::to_string(num_threads) + "_nsl32_ps0";
+                      std::to_string(spec->kv_lora_rank) + "_pe" +
+                      std::to_string(spec->qk_rope_head_dim) + "_bs" +
+                      std::to_string(spec->block_size) + "_g" +
+                      std::to_string(spec->heads_per_tg) + "_nt" +
+                      std::to_string(spec->num_threads) + "_nsl32_ps" +
+                      std::to_string(spec->partition_size);
 
   bool use_partitioning = false;
 
@@ -1827,7 +1839,7 @@ static void dispatch_mla_paged_attention(
   // For G=1, NT=1024: 2*32 + 32*32 = 1088 fp32 ≈ 4.3 KB.
   // For G=2, NT=512:  2*2*16 + 32*32 = 1088 fp32 ≈ 4.3 KB.
   const int BD = 32;
-  const int BN = num_threads / BD;
+  const int BN = spec->num_threads / BD;
   size_t shmem =
       static_cast<size_t>((2 * heads_per_tg * BN + BD * BD) * sizeof(float));
 
@@ -1853,7 +1865,7 @@ static void dispatch_mla_paged_attention(
   // query heads sharing the same latent KV.
   enc.dispatch_threadgroups(
       MTL::Size::Make(num_heads / heads_per_tg, total_q_tokens, 1),
-      MTL::Size::Make(num_threads, 1, 1));
+      MTL::Size::Make(spec->num_threads, 1, 1));
 
   // No add_temporary calls: the only caller is MlaPagedAttentionPrimitive,
   // and inside a primitive MLX manages array lifetimes via the completion
