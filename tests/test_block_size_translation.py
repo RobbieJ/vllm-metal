@@ -285,3 +285,76 @@ class TestMLAKernelBlockSizes:
             for batch in (1, 2, 8, 32)
         }
         assert picked <= admitted
+
+
+class TestNaxKernelInstantiations:
+    """The NAX prefill gate and its kernel instantiations cannot drift.
+
+    ``nax_eligible`` in paged_ops.cpp admits a (dtype, head_size, block_size)
+    space; ``instantiate_paged_attention_nax_all`` in
+    pagedattention_nax.metal compiles one specialization per admitted row.
+    An instantiation beyond the gate compiles dead binary; a gate value
+    without an instantiation dispatches a kernel name that does not exist.
+    """
+
+    _NAX_METAL = (
+        Path(__file__).resolve().parent.parent
+        / "vllm_metal"
+        / "metal"
+        / "kernels_v2"
+        / "pagedattention_nax.metal"
+    )
+    _PAGED_OPS = TestMLAKernelBlockSizes._PAGED_OPS
+
+    def _instantiations(self) -> set[tuple[str, int, int]]:
+        """The (metal-type, head_size, block_size) rows the library compiles.
+
+        Rows live in the ``instantiate_paged_attention_nax_all`` macro body
+        (its ``type`` parameter is bound by the ``..._all(<dtype>)`` call
+        sites below it).
+        """
+        src = self._NAX_METAL.read_text()
+        body_start = src.index("#define instantiate_paged_attention_nax_all")
+        body_end = src.index("\n\n", body_start)
+        shapes = {
+            (int(hs), int(bs))
+            for hs, bs in re.findall(
+                r"instantiate_paged_attention_nax\(\s*type\s*,\s*(\d+)\s*,"
+                r"\s*(\d+)\s*\)",
+                src[body_start:body_end],
+            )
+        }
+        assert shapes, "no instantiate_paged_attention_nax rows found"
+
+        dtypes = set(
+            re.findall(r"^instantiate_paged_attention_nax_all\((\w+)\);", src, re.M)
+        )
+        assert dtypes, "no instantiate_paged_attention_nax_all call sites found"
+        return {(t, hs, bs) for t in dtypes for hs, bs in shapes}
+
+    def test_instantiations_match_the_cpp_gate(self) -> None:
+        cpp = self._PAGED_OPS.read_text()
+        gate = TestMLAKernelBlockSizes._fn_body(cpp, "static bool nax_eligible")
+
+        head_sizes = {int(v) for v in re.findall(r"head_size == (\d+)", gate)}
+        block_sizes = {int(v) for v in re.findall(r"block_size == (\d+)", gate)}
+        dtype_map = dict(
+            re.findall(
+                r'case (\w+):\s*return "(\w+)";',
+                TestMLAKernelBlockSizes._fn_body(
+                    cpp, "static std::string dtype_to_metal"
+                ),
+            )
+        )
+        gate_dtypes = {dtype_map[d] for d in re.findall(r"dtype == (\w+)", gate)}
+        for name, parsed in (
+            ("head_size", head_sizes),
+            ("block_size", block_sizes),
+            ("dtype", gate_dtypes),
+        ):
+            assert parsed, f"could not parse the C++ NAX {name} gate"
+
+        expected = {
+            (t, hs, bs) for t in gate_dtypes for hs in head_sizes for bs in block_sizes
+        }
+        assert self._instantiations() == expected
