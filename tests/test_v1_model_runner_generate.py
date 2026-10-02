@@ -2823,6 +2823,35 @@ class TestDummyForwardOutputsPPRouting:
         assert limits == [80]
 
 
+class TestProfileRunDrafterWarmup:
+    """``profile_run`` must warm the drafter's buffers in the measured peak."""
+
+    def test_profile_run_calls_drafter_profile_warmup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        runner = make_stub_runner(
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=4)
+        )
+        runner._dummy_forward_outputs = Mock(return_value=[])
+        warmups: list[tuple[object, mx.array]] = []
+        runner._drafter = SimpleNamespace(
+            profile_warmup=lambda r, tokens: warmups.append((r, tokens))
+        )
+        cache_readings = iter([100, 180])
+        monkeypatch.setattr(mr.mx, "clear_cache", lambda: None)
+        monkeypatch.setattr(mr.mx, "get_cache_memory", lambda: next(cache_readings))
+        monkeypatch.setattr(mr.mx, "set_cache_limit", lambda _n: None)
+
+        runner.profile_run()
+
+        assert len(warmups) == 1
+        warmed_runner, tokens = warmups[0]
+        assert warmed_runner is runner
+        # The drafter profiles the same max-batched-tokens warmup shape.
+        assert tokens.shape == (1, 4)
+        assert tokens.dtype == mx.int32
+
+
 class TestPipelineGateSpecDecodeDerivation:
     """Runner-side capability derivation for the decode pipeline."""
 
