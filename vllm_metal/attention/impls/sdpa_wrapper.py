@@ -25,6 +25,7 @@ from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import get_context
 from vllm_metal.attention.impls.sdpa import (
+    _float32_sinks,
     sdpa_forward,
 )
 from vllm_metal.attention.patching import walk_and_wrap
@@ -81,6 +82,9 @@ class SDPAPagedAttentionWrapper(nn.Module):
         object.__setattr__(
             self, "_mk_cache_idx", cache_idx if cache_idx is not None else layer_idx
         )
+        # Warm the float32 sink cache at patch time (GPT-OSS stores fp16/bf16
+        # sinks) so the first forward does not pay the cast in the hot path.
+        _float32_sinks(inner)
 
     @property
     def rotary_emb(self) -> Any:

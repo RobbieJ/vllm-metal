@@ -81,6 +81,22 @@ class TestSDPAPagedAttentionWrapper:
 
         assert wrapper.is_local is False
 
+    def test_warms_float32_sinks_at_patch_time(self):
+        # Wrapping must cast non-float32 sinks once, before any forward — the
+        # hot path then only reads the cached tensor.
+        class _Inner:
+            def __init__(self):
+                self.sinks = mx.arange(4, dtype=mx.float16)
+
+        inner = _Inner()
+        assert not hasattr(inner, "_vllm_metal_sinks_f32")
+
+        SDPAPagedAttentionWrapper(inner, layer_idx=0, kv_cache=object(), block_size=16)
+
+        original, cast = inner._vllm_metal_sinks_f32
+        assert original is inner.sinks
+        assert cast.dtype == mx.float32
+
     def test_forwards_precomputed_rope_embeddings_without_context(self):
         class _Inner:
             def __init__(self):
