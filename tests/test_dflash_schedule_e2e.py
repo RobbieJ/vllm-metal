@@ -150,6 +150,8 @@ def test_dflash_scheduler_width_transitions(
     tmp_path, run_in_spawn_process, verify_window
 ):
     baseline = tmp_path / "target.json"
-    run_in_spawn_process(_serve, "target", baseline, verify_window)
-    run_in_spawn_process(_serve_scheduled, baseline, verify_window)
-    run_in_spawn_process(_serve_scheduled, baseline, verify_window, True)
+    run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
+    run_in_spawn_process(_serve_scheduled, baseline, verify_window, label="scheduled")
+    run_in_spawn_process(
+        _serve_scheduled, baseline, verify_window, True, label="scheduled+cancel"
+    )

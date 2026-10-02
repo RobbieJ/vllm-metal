@@ -277,5 +277,5 @@ def test_dflash_serving_parity_and_lifecycle(
     tmp_path, run_in_spawn_process, verify_window
 ):
     baseline = tmp_path / "target.json"
-    run_in_spawn_process(_serve, "target", baseline, verify_window)
-    run_in_spawn_process(_serve, "dflash", baseline, verify_window)
+    run_in_spawn_process(_serve, "target", baseline, verify_window, label="target")
+    run_in_spawn_process(_serve, "dflash", baseline, verify_window, label="dflash")
