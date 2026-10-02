@@ -84,7 +84,10 @@ class SDPAPagedAttentionWrapper(nn.Module):
         )
         # Warm the float32 sink cache at patch time (GPT-OSS stores fp16/bf16
         # sinks) so the first forward does not pay the cast in the hot path.
-        _float32_sinks(inner)
+        # The cast is lazy, so evaluate it here to materialize the array now.
+        sinks_f32 = _float32_sinks(inner)
+        if sinks_f32 is not None:
+            mx.eval(sinks_f32)
 
     @property
     def rotary_emb(self) -> Any:
