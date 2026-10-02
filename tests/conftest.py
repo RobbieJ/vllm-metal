@@ -29,7 +29,9 @@ def run_in_spawn_process(request):
         try:
             process.join(timeout=timeout)
             assert not process.is_alive(), f"{label}: serving test timed out"
-            assert process.exitcode == 0, f"{label}: child process failed"
+            assert process.exitcode == 0, (
+                f"{label}: child process failed (exit {process.exitcode})"
+            )
         finally:
             if process.is_alive():
                 process.terminate()
