@@ -185,17 +185,119 @@ class TestMLAKernelBlockSizes:
         / "kernels_v2"
         / "mla.metal"
     )
+    _PAGED_OPS = (
+        Path(__file__).resolve().parent.parent
+        / "vllm_metal"
+        / "metal"
+        / "paged_ops.cpp"
+    )
 
-    def test_matches_mla_metal_instantiations(self):
-        # instantiate_mla(type, kv_lora_rank, qk_rope_head_dim, block_size, ...)
-        # — a column at the start of a line is a call site; the #define and
-        # comments are excluded by anchoring to the line start.
+    def _instantiations(self) -> set[tuple[str, int, int, int, int, int, int]]:
+        """The full (type, kvr, pe, bs, g, nt, ps) tuple per call site.
+
+        ``instantiate_mla(type, kv_lora_rank, qk_rope_head_dim, block_size,
+        heads_per_tg, num_threads, partition_size)`` — a call at the start
+        of a line; the #define and comments are excluded by that anchor.
+        """
         src = self._MLA_METAL.read_text()
-        instantiated = {
-            int(m.group(1))
+        rows = {
+            (m.group(1), *map(int, m.groups()[1:]))
             for m in re.finditer(
-                r"^instantiate_mla\([^,]+,[^,]+,[^,]+,\s*(\d+)", src, re.M
+                r"^instantiate_mla\(\s*(\w+),\s*(\d+),\s*(\d+),\s*(\d+),"
+                r"\s*(\d+),\s*(\d+),\s*(\d+)\s*\)",
+                src,
+                re.M,
             )
         }
-        assert instantiated, "no instantiate_mla call sites found in mla.metal"
+        assert rows, "no instantiate_mla call sites found in mla.metal"
+        return rows
+
+    @staticmethod
+    def _fn_body(src: str, signature: str) -> str:
+        """One top-level C++ function body: signature to its column-0 ``}``."""
+        start = src.index(signature)
+        return src[start : src.index("\n}\n", start)]
+
+    def test_matches_mla_metal_instantiations(self):
+        instantiated = {bs for _, _, _, bs, _, _, _ in self._instantiations()}
         assert instantiated == set(MLA_KERNEL_BLOCK_SIZES)
+
+    def test_instantiations_match_the_cpp_dispatch_gate(self):
+        """Every instantiated specialization must be dispatchable.
+
+        ``dispatch_mla_paged_attention`` rejects any (kv_lora_rank,
+        qk_rope_head_dim, block_size, heads_per_tg, partition_size, dtype)
+        outside its gate; an instantiation beyond the gate compiles dead
+        binary and a gate value without an instantiation throws at runtime.
+        The call sites must be exactly the gate's admitted space.
+        """
+        cpp = self._PAGED_OPS.read_text()
+        dispatch = self._fn_body(cpp, "static void dispatch_mla_paged_attention")
+        kv_lora_ranks = {int(v) for v in re.findall(r"kv_lora_rank != (\d+)", dispatch)}
+        rope_dims = {int(v) for v in re.findall(r"qk_rope_head_dim != (\d+)", dispatch)}
+        block_sizes = {int(v) for v in re.findall(r"block_size != (\d+)", dispatch)}
+        partitions = {int(v) for v in re.findall(r"_nsl32_ps(\d+)", dispatch)}
+
+        g_to_threads = {
+            int(g): int(nt)
+            for g, nt in re.findall(
+                r"case (\d+):\s*return (\d+);",
+                self._fn_body(cpp, "static int mla_num_threads_for_g"),
+            )
+        }
+
+        # mla_validate_t_dtypes admits only fp16/bf16 for the T buffers; map
+        # them through dtype_to_metal to the instantiated type names.
+        dtype_map = dict(
+            re.findall(
+                r'case (\w+):\s*return "(\w+)";',
+                self._fn_body(cpp, "static std::string dtype_to_metal"),
+            )
+        )
+        gate_dtypes = {
+            dtype_map[d]
+            for d in re.findall(
+                r"expected != (\w+)",
+                self._fn_body(cpp, "static void mla_validate_t_dtypes"),
+            )
+        }
+
+        for name, parsed in (
+            ("kv_lora_rank", kv_lora_ranks),
+            ("qk_rope_head_dim", rope_dims),
+            ("block_size", block_sizes),
+            ("partition_size", partitions),
+            ("heads_per_tg map", g_to_threads),
+            ("dtype gate", gate_dtypes),
+        ):
+            assert parsed, f"could not parse the C++ {name} gate"
+
+        expected = {
+            (t, kvr, pe, bs, g, nt, ps)
+            for t in gate_dtypes
+            for kvr in kv_lora_ranks
+            for pe in rope_dims
+            for bs in block_sizes
+            for g, nt in g_to_threads.items()
+            for ps in partitions
+        }
+        assert self._instantiations() == expected
+
+    def test_python_g_picker_stays_inside_the_gate(self):
+        """_pick_heads_per_tg may only return G values the gate maps."""
+        from vllm_metal.attention.impls.mla import MLAPagedAttentionWrapper
+
+        cpp = self._PAGED_OPS.read_text()
+        admitted = {
+            int(g)
+            for g, _ in re.findall(
+                r"case (\d+):\s*return (\d+);",
+                self._fn_body(cpp, "static int mla_num_threads_for_g"),
+            )
+        }
+        picked = {
+            MLAPagedAttentionWrapper._pick_heads_per_tg(num_heads, batch)
+            for num_heads in range(1, 65)
+            for batch in (1, 2, 8, 32)
+        }
+        assert picked <= admitted
