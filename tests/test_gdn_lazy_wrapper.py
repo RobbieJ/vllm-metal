@@ -1156,6 +1156,7 @@ class TestSplitAndNormalize:
         "dtype,rtol",
         [
             (mx.float32, 1e-4),
+            (mx.float16, 2e-3),
             (mx.bfloat16, 1.5e-2),
         ],
     )
