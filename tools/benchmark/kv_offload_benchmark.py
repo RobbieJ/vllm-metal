@@ -42,7 +42,7 @@ Example:
         --out kv-offload-bench.json
 
 `--kv-cache-tokens` sizes the spilling workload. Take it from the server's
-own startup log line (`max_tokens_cached=...`), or leave it unset and the
+own startup log line (`KV cache size: N tokens`), or leave it unset and the
 script starts a server once to read it.
 
 The spilling workload needs a model whose weights leave a KV cache small
@@ -56,8 +56,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import importlib.metadata
 import json
+import mmap
 import os
 import platform
 import re
@@ -74,10 +76,8 @@ from pathlib import Path
 from typing import Any
 
 READY_TIMEOUT = 1800.0
-MAX_TOKENS_RE = re.compile(r"max_tokens_cached=(\d+)")
-BREAKDOWN_RE = re.compile(
-    r"per_block_bytes=(\d+), num_blocks=(\d+), max_tokens_cached=(\d+)"
-)
+MAX_TOKENS_RE = re.compile(r"KV cache size: ([\d,]+) tokens")
+KV_BUDGET_RE = re.compile(r"reporting ([\d.]+) GB KV budget")
 
 # Leave this much of the filesystem alone. The disk tier writes one file per
 # offloaded block and a spilling workload can ask for tens of GB.
@@ -86,9 +86,8 @@ DISK_HEADROOM_GB = 15.0
 # Leave this much RAM to the rest of the machine. Resident set is weights plus
 # the wired KV cache plus the host offload pool, and the host pool is pageable:
 # overcommit it and the machine swaps or dies rather than the server failing
-# cleanly. Sized so a 128 GB host is warned off --memory-fraction 0.8 with a
-# 16 GiB pool (~93 GB projected), which is enough to take the machine down
-# while leaving the OS, a browser and an editor running.
+# cleanly. The pool is budgeted inside --gpu-memory-utilization, so the
+# fraction alone bounds weights, wired cache and pool together.
 RAM_HEADROOM_GB = 40.0
 
 # TTFT only means "time to prefill" while the server is not saturated. Firing
@@ -153,14 +152,13 @@ def preflight_memory(args: argparse.Namespace) -> list[str]:
         return warnings
     # The wired cache is sized off the recommended working set, itself about
     # 75% of RAM, so the fraction lands on that rather than on RAM directly.
-    projected = ram * 0.75 * args.memory_fraction + args.offload_size_gib
+    projected = ram * 0.75 * args.memory_fraction
     if projected > ram - RAM_HEADROOM_GB:
         warnings.append(
-            f"--memory-fraction {args.memory_fraction} plus a "
-            f"{args.offload_size_gib:.0f} GiB host pool projects to "
-            f"~{projected:.0f} GB resident on a {ram:.0f} GB machine. The host "
-            "pool is pageable, so this swaps or OOMs rather than failing "
-            "cleanly. Lower --memory-fraction or --offload-size-gib."
+            f"--memory-fraction {args.memory_fraction} projects to "
+            f"~{projected:.0f} GB resident on a {ram:.0f} GB machine, host "
+            "pool included. The pool is pageable, so this swaps or OOMs "
+            "rather than failing cleanly. Lower --memory-fraction."
         )
     return warnings
 
@@ -210,6 +208,8 @@ class ServerProcess:
             str(self.port),
             "--max-model-len",
             str(self.args.max_model_len),
+            "--gpu-memory-utilization",
+            str(self._fraction()),
         ]
         if self.args.revision:
             cmd += ["--revision", self.args.revision]
@@ -222,7 +222,16 @@ class ServerProcess:
             ]
             if self.store_dir is not None:
                 extra = {
-                    "secondary_tiers": [{"type": "fs", "root_dir": str(self.store_dir)}]
+                    "secondary_tiers": [
+                        {
+                            "type": "fs",
+                            "root_dir": str(self.store_dir),
+                            # The tier's own cap, not an estimate, bounds the
+                            # store. Its default (10% of the volume) ignores
+                            # free space.
+                            "max_size_gib": self.args.store_cap_gib,
+                        }
+                    ]
                 }
                 cmd += [
                     "--kv-transfer-config",
@@ -230,23 +239,20 @@ class ServerProcess:
                 ]
         return cmd + self.args.serve_arg
 
+    def _fraction(self) -> float:
+        # The pool comes out of the fraction, so at the same fraction both
+        # arms hold the same total bytes: the offload arm trades wired cache
+        # for pool. --baseline-memory-fraction overrides the baseline only.
+        if self.fraction is not None:
+            return self.fraction
+        if not self.offload and self.args.baseline_memory_fraction:
+            return self.args.baseline_memory_fraction
+        return self.args.memory_fraction
+
     def _env(self) -> dict[str, str]:
         env = dict(os.environ)
-        env["VLLM_METAL_USE_PAGED_ATTENTION"] = "1"
-        # The baseline can be given a larger wired cache so both arms hold
-        # the same total KV bytes. Without that, an offload run with a host
-        # pool on top of its cache simply has more memory, and the result
-        # cannot separate "offloading works" from "more memory works".
-        fraction = self.args.memory_fraction
-        if not self.offload and self.args.baseline_memory_fraction:
-            fraction = self.args.baseline_memory_fraction
-        if self.fraction is not None:
-            fraction = self.fraction
-        env["VLLM_METAL_MEMORY_FRACTION"] = str(fraction)
-        # Block filenames are content hashes and hash seeding is per process.
-        # Without this a restarted server cannot find what the previous one
-        # wrote, and the restart workload measures nothing.
-        env["PYTHONHASHSEED"] = "0"
+        # Restart reuse must work with the default sha256 hash and no seed.
+        env.pop("PYTHONHASHSEED", None)
         return env
 
     def __enter__(self) -> ServerProcess:
@@ -281,14 +287,13 @@ class ServerProcess:
                         text = self.log_path.read_text()
                         found = MAX_TOKENS_RE.search(text)
                         if found:
-                            self.max_tokens_cached = int(found.group(1))
-                        shape = BREAKDOWN_RE.search(text)
-                        if shape:
-                            block_bytes, blocks, tokens = (
-                                int(g) for g in shape.groups()
-                            )
-                            if tokens:
-                                self.bytes_per_token = block_bytes * blocks / tokens
+                            tokens = int(found.group(1).replace(",", ""))
+                            self.max_tokens_cached = tokens
+                            budget = KV_BUDGET_RE.search(text)
+                            if budget and tokens:
+                                self.bytes_per_token = (
+                                    float(budget.group(1)) * 1e9 / tokens
+                                )
                         return
             time.sleep(2)
         raise RuntimeError(f"server not ready within {READY_TIMEOUT:.0f}s")
@@ -304,6 +309,40 @@ class ServerProcess:
             self.proc.wait(timeout=30)
         # Do not hand the next server a port still in TIME_WAIT.
         time.sleep(5)
+
+
+MS_INVALIDATE = 0x0002  # Darwin <sys/mman.h>
+
+
+def evict_from_page_cache(root: Path) -> int:
+    """Drop the store's files from the buffer cache, without root.
+
+    The restart pass reads blocks the previous process wrote moments ago.
+    Upstream's fs tier writes through the buffer cache, so without this the
+    "disk" restore is served from RAM. Returns bytes invalidated.
+    """
+    if sys.platform != "darwin":
+        return 0
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    done = 0
+    for path in root.rglob("*"):
+        if not path.is_file() or path.stat().st_size == 0:
+            continue
+        size = path.stat().st_size
+        fd = os.open(path, os.O_RDWR)
+        try:
+            mapping = mmap.mmap(fd, size)
+            try:
+                addr = ctypes.addressof(ctypes.c_char.from_buffer(mapping))
+                if libc.msync(addr, size, MS_INVALIDATE) == 0:
+                    done += size
+                del addr
+            finally:
+                mapping.close()
+        finally:
+            os.close(fd)
+    return done
 
 
 def bench_serve(
@@ -334,13 +373,16 @@ def bench_serve(
         str(out_json),
         *dataset,
     ]
+    # A result file from an earlier call must not stand in for this one.
+    out_json.unlink(missing_ok=True)
     proc = subprocess.run(
         cmd, capture_output=True, text=True, timeout=args.bench_timeout
     )
-    if not out_json.exists():
+    if proc.returncode != 0 or not out_json.exists():
         raise RuntimeError(
-            "vllm bench serve produced no result file\n"
-            f"stdout:\n{proc.stdout[-2000:]}\nstderr:\n{proc.stderr[-2000:]}"
+            f"vllm bench serve failed (rc={proc.returncode}) or produced no "
+            f"result file\nstdout:\n{proc.stdout[-2000:]}\n"
+            f"stderr:\n{proc.stderr[-2000:]}"
         )
     return json.loads(out_json.read_text())
 
@@ -461,7 +503,7 @@ def workloads(
                 "--dataset-name",
                 "prefix_repetition",
                 "--num-prompts",
-                str(args.num_prompts),
+                str(fits_prompts),
                 "--prefix-repetition-num-prefixes",
                 str(fits_prefixes),
                 *prefix_args,
@@ -492,7 +534,7 @@ def workloads(
                 "--dataset-name",
                 "prefix_repetition",
                 "--num-prompts",
-                str(args.num_prompts),
+                str(fits_prompts),
                 "--prefix-repetition-num-prefixes",
                 str(max(2, fits_prefixes)),
                 *prefix_args,
@@ -540,15 +582,20 @@ def one_sample(
                         f.stat().st_size for f in store.rglob("*") if f.is_file()
                     )
                 return sample
+        evicted = None
         if spec["restart"]:
             with ServerProcess(
                 args, offload, store, work_dir / f"{tag}.warm.log"
             ) as srv:
                 bench_serve(args, srv.port, spec["args"], work_dir / f"{tag}.warm.json")
+            if store is not None:
+                evicted = evict_from_page_cache(store)
         with ServerProcess(args, offload, store, work_dir / f"{tag}.log") as srv:
             result = bench_serve(args, srv.port, spec["args"], work_dir / f"{tag}.json")
             sample = {k: result[k] for k in METRICS if k in result}
             sample["max_tokens_cached"] = srv.max_tokens_cached
+            if evicted is not None:
+                sample["page_cache_evicted_bytes"] = evicted
             if store is not None:
                 sample["store_bytes"] = sum(
                     f.stat().st_size for f in store.rglob("*") if f.is_file()
@@ -595,6 +642,10 @@ def spread_pct(rows: list[dict], key: str) -> float | None:
     return round(100 * (quarts[2] - quarts[0]) / mid, 1) if mid else None
 
 
+def format_pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value}%"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="KV offloading serving benchmark",
@@ -606,23 +657,24 @@ def main(argv: list[str] | None = None) -> int:
         "--memory-fraction",
         type=float,
         default=0.8,
-        help="VLLM_METAL_MEMORY_FRACTION (default: 0.8, as in docs/CONTRIBUTING.md)",
+        help="--gpu-memory-utilization for both arms; the host pool comes out of it "
+        "(default: 0.8)",
     )
     parser.add_argument(
         "--offload-size-gib",
         type=float,
         default=16.0,
-        help="--kv-offloading-size for the offload variant (default: 16)",
+        help="--kv-offloading-size for the offload variant (default: 16). "
+        "0 or less sizes the pool at 1.3x the probed KV cache, which needs the "
+        "probe, so it cannot be combined with --kv-cache-tokens.",
     )
     parser.add_argument(
         "--baseline-memory-fraction",
         type=float,
         default=0.0,
-        help="VLLM_METAL_MEMORY_FRACTION for the no-offload arm only. Set it "
-        "so the baseline's wired KV cache equals the offload arm's cache "
-        "plus its host pool, and the comparison isolates offloading from "
-        "simply having more memory. 0 (default) uses --memory-fraction for "
-        "both.",
+        help="--gpu-memory-utilization for the no-offload arm only. The pool "
+        "comes out of the fraction, so 0 (default, same fraction for both) "
+        "already compares equal total memory.",
     )
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--prefix-len", type=int, default=3072)
@@ -652,7 +704,9 @@ def main(argv: list[str] | None = None) -> int:
         "--serve-arg",
         action="append",
         default=[],
-        help="extra argument passed through to vllm serve (repeatable)",
+        help="extra argument passed through to vllm serve (repeatable). One "
+        "token per use, with the = form for flags: --serve-arg=--dtype "
+        "--serve-arg=float16",
     )
     parser.add_argument(
         "--bench-timeout",
@@ -672,6 +726,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--keep-logs", action="store_true")
     args = parser.parse_args(argv)
+    free_gib = shutil.disk_usage(work_root()).free / (1 << 30)
+    args.store_cap_gib = round(max(1.0, free_gib - DISK_HEADROOM_GB), 1)
+    print(f"disk store cap: {args.store_cap_gib} GiB", file=sys.stderr)
 
     for warning in preflight_memory(args):
         print(f"WARNING: {warning}", file=sys.stderr)
@@ -794,7 +851,7 @@ def main(argv: list[str] | None = None) -> int:
             suspect.append(name)
         print(
             f"{name:16} {off_ttft:11.1f} {on_ttft:11.1f} {ratio:6.2f}x  "
-            f"off {off_spread}% on {on_spread}%"
+            f"off {format_pct(off_spread)} on {format_pct(on_spread)}"
         )
 
     record["summary"] = summary
