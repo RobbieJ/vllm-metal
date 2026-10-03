@@ -925,6 +925,16 @@ class MetalModelRunner:
         """
         return self._supports_mm_inputs or adapter.requires_explicit_positions
 
+    @staticmethod
+    def _mm_forward_forced(adapter: MultimodalRuntimeAdapter | None) -> bool:
+        """Whether a forward-ready adapter routes text batches through the
+        mm forward (``requires_explicit_positions``)."""
+        return (
+            adapter is not None
+            and adapter.forward_ready
+            and adapter.requires_explicit_positions
+        )
+
     def _dummy_encoder_outputs(self) -> list[mx.array]:
         """Encoder outputs for one profiling feature, when the adapter offers one."""
         adapter = self._multimodal_adapter
@@ -1257,11 +1267,7 @@ class MetalModelRunner:
         # caches, corrupting decode/packed/chunked text batches.  Adapters flag
         # ``requires_explicit_positions`` so text-only batches also run the mm
         # forward, which always passes position_ids.
-        use_mm_forward = has_mm or (
-            adapter is not None
-            and adapter.forward_ready
-            and adapter.requires_explicit_positions
-        )
+        use_mm_forward = has_mm or self._mm_forward_forced(adapter)
 
         # ---- build unified token sequence: decode first, then prefill ----
         all_token_ids: list[int] = []
@@ -1544,11 +1550,7 @@ class MetalModelRunner:
                 decode_params.append(state.sampling_params)
 
         adapter = self._multimodal_adapter
-        mm_forward_forced = (
-            adapter is not None
-            and adapter.forward_ready
-            and adapter.requires_explicit_positions
-        )
+        mm_forward_forced = self._mm_forward_forced(adapter)
         capabilities = RunnerCapabilities(
             pipeline_enabled=envs.VLLM_METAL_DECODE_PIPELINE,
             use_async_scheduling=self.use_async_scheduling,
