@@ -20,7 +20,7 @@ import mlx.core as mx
 import numpy as np
 from mlx_lm import load
 
-from tools.attention_bench_utils import native_source_hashes, package_versions
+from tools.attention_bench_utils import compare, native_source_hashes, package_versions
 from vllm_metal.v1.dflash import DFlashTargetCapture, load_dflash
 from vllm_metal.v1.draft_checkpoint import load_draft_weights
 
@@ -29,22 +29,6 @@ from vllm_metal.v1.draft_checkpoint import load_draft_weights
 # the tensor, precision and finite-value rules; DFlashTargetCapture.run
 # produces the target features the draft reads.
 NATIVE_SOURCES = (load_dflash, load_draft_weights, DFlashTargetCapture.run)
-
-
-def compare(actual: mx.array, expected: mx.array) -> dict:
-    actual, expected = (
-        np.array(actual.astype(mx.float32)),
-        np.array(expected.astype(mx.float32)),
-    )
-    if actual.shape != expected.shape or not actual.size:
-        raise ValueError(f"Incomplete comparison: {actual.shape} != {expected.shape}")
-    np.testing.assert_allclose(actual, expected, atol=1e-3, rtol=1e-3, equal_nan=False)
-    if not np.isfinite(actual).all() or not np.isfinite(expected).all():
-        raise ValueError("Non-finite output in DFlash comparison")
-    return {
-        "max_abs_error": float(np.max(np.abs(actual - expected))),
-        "exact": bool(np.array_equal(actual, expected)),
-    }
 
 
 def qualify(

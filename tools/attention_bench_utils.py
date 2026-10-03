@@ -46,6 +46,41 @@ def native_source_hashes(*functions: FunctionType) -> dict[str, str]:
     return hashes
 
 
+def compare(
+    actual: mx.array,
+    expected,
+    *,
+    atol: float = 1e-3,
+    rtol: float = 1e-3,
+) -> dict[str, object]:
+    """Assert a native output matches its reference within tolerance.
+
+    ``expected`` may be an MLX array, a NumPy array, or a torch tensor
+    (converted through ``detach().float().cpu().numpy()`` so this module
+    does not import torch).  Shape mismatches, empty outputs and
+    non-finite values are rejected before the tolerance check.  Returns
+    the max absolute error and whether the outputs match bit-for-bit.
+    """
+    actual_np = np.array(actual.astype(mx.float32))
+    if isinstance(expected, mx.array):
+        expected_np = np.array(expected.astype(mx.float32))
+    elif isinstance(expected, np.ndarray):
+        expected_np = expected.astype(np.float32)
+    else:
+        expected_np = expected.detach().float().cpu().numpy()
+    if actual_np.shape != expected_np.shape or not actual_np.size:
+        raise ValueError(
+            f"Incomplete comparison: {actual_np.shape} != {expected_np.shape}"
+        )
+    if not np.isfinite(actual_np).all() or not np.isfinite(expected_np).all():
+        raise ValueError("Non-finite output in comparison")
+    np.testing.assert_allclose(actual_np, expected_np, atol=atol, rtol=rtol)
+    return {
+        "max_abs_error": float(np.max(np.abs(actual_np - expected_np))),
+        "exact": bool(np.array_equal(actual_np, expected_np)),
+    }
+
+
 def ref_paged_attn(
     query: mx.array,
     key_cache: mx.array,

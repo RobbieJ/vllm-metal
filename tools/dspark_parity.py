@@ -29,27 +29,13 @@ from mlx_lm import load
 from safetensors.torch import load_file
 from transformers import Qwen3Config
 
-from tools.attention_bench_utils import native_source_hashes, package_versions
+from tools.attention_bench_utils import compare, native_source_hashes, package_versions
 from vllm_metal.v1.dflash import DFlashTargetCapture
 from vllm_metal.v1.draft_checkpoint import load_draft_weights
 from vllm_metal.v1.dspark import DSparkConfig, load_dspark
 
 # Every function that decides which weights produce the numbers in a report.
 NATIVE_SOURCES = (load_dspark, load_draft_weights, DFlashTargetCapture.run)
-
-
-def compare(actual, expected, *, atol, rtol):
-    actual = np.array(actual.astype(mx.float32))
-    expected = expected.detach().float().cpu().numpy()
-    if actual.shape != expected.shape or not actual.size:
-        raise ValueError(f"Incomplete comparison: {actual.shape} != {expected.shape}")
-    if not np.isfinite(actual).all() or not np.isfinite(expected).all():
-        raise ValueError("Non-finite DSpark output")
-    np.testing.assert_allclose(actual, expected, atol=atol, rtol=rtol)
-    return {
-        "exact": bool(np.array_equal(actual, expected)),
-        "max_abs_error": float(np.max(np.abs(actual - expected))),
-    }
 
 
 def check_tokens(actual, expected, actual_logits, expected_logits):
