@@ -66,8 +66,8 @@ warns at startup. Every server sharing a store must use the same value.
 
 ## KV events for routing
 
-A KV-aware router, such as llm-d's, can track which blocks each server holds,
-including blocks on disk. Turn on KV cache events with `--kv-events-config`
+A KV-aware router can track which blocks each server holds, including blocks
+on disk. Turn on KV cache events with `--kv-events-config`
 (`"enable_kv_cache_events": true` plus a publisher). The disk tier then also
 publishes its stores and evictions. `enable_kv_events` on the tier is set for
 you. Setting it on the tier without the global switch logs a warning, because

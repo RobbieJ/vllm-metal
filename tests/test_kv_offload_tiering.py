@@ -195,7 +195,7 @@ def test_tiering_spec_builds_manager_through_upstream(tmp_path) -> None:
 
 def test_events_reach_the_manager_from_the_disk_tier(tmp_path) -> None:
     """A stored block must surface as an event at the manager, where
-    KV-aware routing (llm-d) reads it, not only at the tier."""
+    a KV-aware router reads it, not only at the tier."""
     spec = MetalTieringOffloadingSpec(
         _offloading_config(
             extra_config={
