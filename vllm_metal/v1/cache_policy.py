@@ -50,6 +50,8 @@ from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+
     from vllm_metal.v1.model_runner import MetalModelRunner
     from vllm_metal.v1.worker import MetalWorker
 
@@ -179,6 +181,18 @@ def _build_turboquant_attention_spec(
     )
 
 
+def uses_metal_offloading(vllm_config: VllmConfig) -> bool:
+    """True when the Metal offloading connector is configured.
+
+    The platform hook sets it. Other connectors keep upstream behaviour.
+    """
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    return (
+        kv_transfer_config is not None
+        and kv_transfer_config.kv_connector == "MetalOffloadingConnector"
+    )
+
+
 @dataclass(frozen=True)
 class _PagedAttentionPlan:
     block_size: int
@@ -190,6 +204,9 @@ class _PagedAttentionPlan:
     per_block_bytes: int
     kv_budget: int
     num_blocks: int
+    # KV offload host pool. Pageable, but the same physical RAM as the wired
+    # cache on unified memory, so it comes out of the same budget.
+    kv_offload_pool: int = 0
 
     def format_breakdown(self) -> str:
         parts = [
@@ -199,6 +216,8 @@ class _PagedAttentionPlan:
             f"model_memory={self.model_memory / 1e9:.2f}GB",
             f"overhead={self.overhead / 1e9:.2f}GB",
         ]
+        if self.kv_offload_pool:
+            parts.append(f"kv_offload_pool={self.kv_offload_pool / 1e9:.2f}GB")
         parts.append(f"kv_budget={self.kv_budget / 1e9:.2f}GB")
         return ", ".join(parts)
 
@@ -207,6 +226,8 @@ class _PagedAttentionPlan:
             f"increase --gpu-memory-utilization (currently {self.fraction})",
             "use a smaller or more quantized model",
         ]
+        if self.kv_offload_pool:
+            mitigations.insert(0, "lower --kv-offloading-size")
         return "Mitigations: " + "; ".join(mitigations) + "."
 
 
@@ -1038,11 +1059,15 @@ class WorkerCachePlanner:
                     workspace / 2**20,
                 )
         usable_metal = int(metal_limit * fraction)
-        kv_budget = self.base_kv_budget_bytes(
-            metal_limit,
-            model_memory,
-            fraction,
-            overhead,
+        kv_offload_pool = self._kv_offload_pool_bytes()
+        kv_budget = (
+            self.base_kv_budget_bytes(
+                metal_limit,
+                model_memory,
+                fraction,
+                overhead,
+            )
+            - kv_offload_pool
         )
         return _PagedAttentionPlan(
             block_size=block_size,
@@ -1054,7 +1079,21 @@ class WorkerCachePlanner:
             per_block_bytes=per_block_bytes,
             kv_budget=kv_budget,
             num_blocks=max(0, kv_budget // per_block_bytes),
+            kv_offload_pool=kv_offload_pool,
         )
+
+    def _kv_offload_pool_bytes(self) -> int:
+        """Host pool bytes of the Metal offloading connector, else 0.
+
+        The pool is the same physical RAM as the wired cache, so it comes out
+        of the same budget.
+        """
+        vllm_config = self._worker.vllm_config
+        if not uses_metal_offloading(vllm_config):
+            return 0
+        assert vllm_config.kv_transfer_config is not None
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        return max(0, int(extra.get("cpu_bytes_to_use", 0)))
 
     def _validate_paged_attention_plan(
         self, plan: _PagedAttentionPlan, *, require_min_blocks: bool
