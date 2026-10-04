@@ -763,6 +763,10 @@ class MetalPlatform(Platform):
             # rejections (multimodal, STT) further below, so an unsupported DP
             # config fails fast before any ray.init side effect.
 
+        from vllm_metal.v1.kv_offload.config import configure_kv_offloading
+
+        configure_kv_offloading(vllm_config)
+
         scheduler_config = vllm_config.scheduler_config
 
         # Pipeline parallelism relays each sampled token to the first stage via the
