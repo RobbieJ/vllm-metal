@@ -199,16 +199,46 @@ def test_other_connector_with_offloading_rejected() -> None:
         MetalPlatform.check_and_update_config(vllm_config)
 
 
-def test_explicit_connector_without_size_rejected() -> None:
+def _explicit_connector_config(extra: dict) -> SimpleNamespace:
+    import torch
+
     vllm_config = _base_config()
+    model = vllm_config.model_config
+    model.dtype = torch.bfloat16
+    model.get_num_layers = lambda parallel_config: 28
+    model.get_total_num_kv_heads = lambda: 8
+    model.get_head_size = lambda: 128
     vllm_config.kv_transfer_config = SimpleNamespace(
         kv_connector="OffloadingConnector",
         kv_connector_module_path=None,
         kv_role="kv_both",
-        kv_connector_extra_config={},
+        kv_connector_extra_config=extra,
     )
-    with pytest.raises(NotImplementedError, match="--kv-offloading-size"):
-        MetalPlatform.check_and_update_config(vllm_config)
+    return vllm_config
+
+
+def test_explicit_connector_without_size_gets_a_default_pool() -> None:
+    """The pool is sized from max_model_len, and the engine core's second
+    pass of the hook keeps it."""
+    from vllm_metal.v1.kv_offload.config import DEFAULT_POOL_MAX_MODEL_LENS
+
+    vllm_config = _explicit_connector_config({})
+    MetalPlatform.check_and_update_config(vllm_config)
+
+    bytes_per_token = 2 * 28 * 8 * 128 * 2  # K and V, bf16
+    expected = DEFAULT_POOL_MAX_MODEL_LENS * 4096 * bytes_per_token
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == expected
+
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert extra["cpu_bytes_to_use"] == expected
+
+
+def test_explicit_connector_size_is_kept() -> None:
+    vllm_config = _explicit_connector_config({"cpu_bytes_to_use": 3 << 30})
+    MetalPlatform.check_and_update_config(vllm_config)
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == 3 << 30
 
 
 def test_unknown_spec_name_rejected() -> None:

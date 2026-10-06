@@ -41,6 +41,21 @@ extra memory. The startup memory breakdown shows it as `kv_offload_pool=`. A
 pool larger than the budget fails at startup, after the weights load, with the
 breakdown and the fix. 8 GiB was enough for the Qwen3-32B benchmark in #737.
 
+To size the pool automatically, name the connector and leave out the size:
+
+```bash
+vllm serve Qwen/Qwen3-8B \
+  --kv-transfer-config '{"kv_connector": "OffloadingConnector", "kv_role": "kv_both",
+    "kv_connector_extra_config": {"secondary_tiers":
+    [{"type": "fs", "root_dir": "/path/to/kv-store", "max_size_gib": 50}]}}'
+```
+
+The pool then holds two full-length requests of KV (2 x `max_model_len`
+tokens), logged at startup. That is about 4 GiB for Qwen3-32B at 8192 tokens.
+The pool only holds blocks until their disk write completes. When it is full,
+the store is retried on the next step and counted in
+`vllm:kv_offload_allocation_failure`; the block is not lost.
+
 ## Limits
 
 Only uniform full-attention models are supported (GQA, MHA, MQA), for example

@@ -33,6 +33,36 @@ def _configure_kv_events(vllm_config: VllmConfig, extra: dict[str, Any]) -> None
             tier.setdefault("enable_kv_events", True)
 
 
+# Pool size when the connector is configured without one, in full-length
+# requests of KV. A store that does not fit is retried on the next step, so
+# the pool only has to keep up with disk writes. On Mistral-7B and Qwen3-32B
+# at concurrency 4, pools from 0.5x to 4x stored the same bytes at the same
+# TTFT, and 2x needed no retries.
+DEFAULT_POOL_MAX_MODEL_LENS = 2
+
+
+def default_pool_bytes(vllm_config: VllmConfig) -> int:
+    """Host pool bytes for ``DEFAULT_POOL_MAX_MODEL_LENS`` full-length requests.
+
+    The pool stages each store until the disk write completes, so it needs
+    room for the stores in flight, not for the working set.
+    """
+    from vllm.utils.torch_utils import get_dtype_size, get_kv_cache_torch_dtype
+
+    model_config = vllm_config.model_config
+    dtype = get_kv_cache_torch_dtype(
+        vllm_config.cache_config.cache_dtype, model_config.dtype
+    )
+    bytes_per_token = (
+        2  # K and V
+        * model_config.get_num_layers(vllm_config.parallel_config)
+        * model_config.get_total_num_kv_heads()
+        * model_config.get_head_size()
+        * get_dtype_size(dtype)
+    )
+    return DEFAULT_POOL_MAX_MODEL_LENS * model_config.max_model_len * bytes_per_token
+
+
 def configure_kv_offloading(vllm_config: VllmConfig) -> None:
     """Translate --kv-offloading-size and validate the KV connector.
 
@@ -120,9 +150,12 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
         extra["cpu_bytes_to_use"] = int(kv_offloading_size * (1 << 30))
         cache_config.kv_offloading_size = None
     elif "cpu_bytes_to_use" not in extra:
-        raise NotImplementedError(
-            "KV offloading on Metal needs a host pool size: pass "
-            "--kv-offloading-size N (GiB) alongside the connector."
+        extra["cpu_bytes_to_use"] = default_pool_bytes(vllm_config)
+        logger.info(
+            "KV offloading host pool defaulting to %.2f GiB (%d x max_model_len "
+            "of KV); pass --kv-offloading-size to set it",
+            extra["cpu_bytes_to_use"] / (1 << 30),
+            DEFAULT_POOL_MAX_MODEL_LENS,
         )
     # Only "fs" works here; "obj" needs NIXL, which has no macOS build.
     # The spec renames "fs" to MetalFileSystemTierManager. This hook runs again
