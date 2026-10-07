@@ -169,6 +169,7 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
     extra = kv_transfer_config.kv_connector_extra_config
     if kv_offloading_size is not None:
         extra["cpu_bytes_to_use"] = int(kv_offloading_size * (1 << 30))
+        extra.pop(AUTO_POOL_KEY, None)  # a user-set size is never capped
         cache_config.kv_offloading_size = None
     elif "cpu_bytes_to_use" not in extra:
         extra["cpu_bytes_to_use"] = default_host_pool_bytes(vllm_config)
@@ -176,7 +177,7 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
         logger.info_once(
             "KV offloading on Metal: no --kv-offloading-size given, so the host "
             "pool defaults to %.2f GiB, two --max-model-len requests (%d tokens "
-            "each) of KV, before the budget cap.",
+            "each) of KV; it may be capped to fit the budget.",
             extra["cpu_bytes_to_use"] / 2**30,
             model_config.max_model_len,
         )

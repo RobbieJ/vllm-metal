@@ -38,10 +38,11 @@ Without `--kv-offloading-size`, the pool defaults to the KV of two
 `--max-model-len` requests, rounded up to whole blocks. A full pool does not lose
 a block, the scheduler retries the store on the next step; two requests is the
 smallest pool with no retries at concurrency 4 in the #1037 measurements. The
-default is capped so the KV cache keeps at least three quarters of its budget
-(what is left after the weights and activation overhead) and room for one
-`--max-model-len` request. The startup log says when it is capped. Pass the
-flag to size it yourself.
+default is capped at a quarter of the KV budget (after weights and
+activations), or one host chunk if that is larger, and leaves room for one
+`--max-model-len` request. With `--max-model-len -1` or
+`--num-gpu-blocks-override` no request is reserved. The startup log says when
+the pool is changed. Pass the flag to size it yourself.
 
 The host pool comes out of `--gpu-memory-utilization` (see
 [Configuration](configuration.md#kv-cache-memory-settings)), which is the total

@@ -99,6 +99,19 @@ def _offline_platform(monkeypatch: pytest.MonkeyPatch):
     reset_config()
 
 
+def test_offloading_size_drops_a_user_set_auto_pool_marker() -> None:
+    """The marker is internal; an explicit size is never capped."""
+    vllm_config = _base_config(kv_offloading_size=2.0)
+    vllm_config.kv_transfer_config = SimpleNamespace(
+        kv_connector=None,
+        kv_connector_module_path=None,
+        kv_role=None,
+        kv_connector_extra_config={AUTO_POOL_KEY: True},
+    )
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert AUTO_POOL_KEY not in vllm_config.kv_transfer_config.kv_connector_extra_config
+
+
 def test_offloading_size_translates_to_metal_connector() -> None:
     vllm_config = _base_config(kv_offloading_size=2.0)
     MetalPlatform.check_and_update_config(vllm_config)
