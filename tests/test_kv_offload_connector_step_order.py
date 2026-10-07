@@ -13,82 +13,27 @@ Two levels are covered. ``execute_model`` is driven for real, far enough to
 record that it handles preemptions before opening the step, then stopped with
 a deliberate raise; that pins the call order itself. The cross-step tests then
 drive the runner's helpers in that same order to pin the lifecycle across a
-step boundary, which no single ``execute_model`` call can show.
+step boundary, which no single ``execute_model`` call can show. The real
+``MetalKVConnector`` runs throughout, over a spy transfer group.
 """
 
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
 from vllm.sampling_params import SamplingParams
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
 
 import vllm_metal.v1.model_runner as mr
+from tests.kv_connector_spy import SpyTransferGroup, spy_group  # noqa: F401
 from tests.stub_runner import make_stub_runner
 
 
-class _ConnectorSpy:
-    """Records the connector lifecycle and enforces upstream's invariants.
-
-    Mirrors the two things upstream does that this test is about: metadata is
-    bound on enter and cleared on the no-forward path, and ``get_finished``
-    asserts the metadata is still bound when the context closes.
-    """
-
-    def __init__(self) -> None:
-        self.events: list[str] = []
-        self.metadata_bound = False
-        self.step = "?"
-
-    # -- the runner's collaborators -------------------------------------
-    def handle_preemptions(self, metadata) -> None:
-        del metadata
-        self.events.append(f"preempt:{self.step}")
-
-    def no_forward(self, *args, **kwargs):
-        del args, kwargs
-        self.events.append(f"no_forward:{self.step}")
-        self.metadata_bound = False  # upstream clears on this path
-        return mr.EMPTY_MODEL_RUNNER_OUTPUT
-
-    @contextmanager
-    def step_context(self, scheduler_output, *args, **kwargs):
-        del scheduler_output, args, kwargs
-        self.metadata_bound = True
-        self.events.append(f"open:{self.step}")
-        output = KVConnectorOutput()
-        try:
-            yield output
-        finally:
-            if not self.metadata_bound:
-                raise AssertionError(
-                    "connector step closed after its metadata was cleared"
-                )
-            self.events.append(f"close:{self.step}")
-            output.finished_recving = {f"r-{self.step}"}
-
-
 @pytest.fixture
-def spy(monkeypatch) -> _ConnectorSpy:
-    connector = _ConnectorSpy()
-    monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: True)
-    monkeypatch.setattr(mr, "get_kv_transfer_group", lambda: connector)
-    monkeypatch.setattr(mr, "set_forward_context", lambda *a, **k: nullcontext())
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "_get_kv_connector_output",
-        staticmethod(connector.step_context),
-    )
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "kv_connector_no_forward",
-        staticmethod(connector.no_forward),
-    )
-    return connector
+def spy(spy_group: SpyTransferGroup) -> SpyTransferGroup:  # noqa: F811
+    return spy_group
 
 
 def _scheduler_output(req_ids: list[str]) -> SchedulerOutput:
@@ -142,7 +87,9 @@ def test_zero_token_step_still_handles_preemptions(spy):
 
     runner.execute_model(_scheduler_output([]))
 
-    assert spy.events == ["preempt:1", "no_forward:1"]
+    # no_forward runs a whole step: preempt, open and close.
+    assert spy.events == ["preempt:1", "open:1", "close:1"]
+    assert not spy.metadata_bound
 
 
 def _pipelined_decode_step(runner, spy, tag: str) -> None:
@@ -150,8 +97,7 @@ def _pipelined_decode_step(runner, spy, tag: str) -> None:
     spy.step = tag
     scheduler_output = _scheduler_output(["r0"])
 
-    # execute_model: preemptions are handled BEFORE the step context opens.
-    spy.handle_preemptions(None)
+    # As execute_model: the step start handles preemptions, then opens.
     runner._kv_connector_start_step(scheduler_output)
 
     state = mr.RequestState(
@@ -182,7 +128,7 @@ def _pipelined_decode_step(runner, spy, tag: str) -> None:
     runner.sample_tokens(grammar_output=None)
 
 
-def test_step_context_closes_before_the_next_step_handles_preemptions(spy):
+def test_step_closes_before_the_next_step_handles_preemptions(spy):
     """close(k) must precede preempt(k+1), or the flush fence is a no-op."""
     runner = make_stub_runner(model=SimpleNamespace())
 
@@ -211,16 +157,15 @@ def test_zero_token_step_after_a_pipelined_step_does_not_crash(spy):
     # Step 2 schedules nothing: execute_model takes the no-forward path and
     # sample_tokens is never called.
     spy.step = "2"
-    spy.handle_preemptions(None)
-    spy.no_forward(_scheduler_output([]), runner.vllm_config)
+    runner.execute_model(_scheduler_output([]))
 
-    # Step 3 opens its own context. With step 1 leaked, the recovery close
-    # would run against cleared metadata and raise.
+    # Step 3 opens its own step. With step 1 leaked, the recovery close would
+    # run against cleared metadata and raise.
     spy.step = "3"
     runner._kv_connector_start_step(_scheduler_output(["r0"]))
 
     assert "close:1" in spy.events
-    assert spy.events.index("close:1") < spy.events.index("no_forward:2")
+    assert spy.events.index("close:1") < spy.events.index("preempt:2")
 
 
 def test_sample_tokens_without_pending_state_closes_the_step(spy):
@@ -232,8 +177,11 @@ def test_sample_tokens_without_pending_state_closes_the_step(spy):
 
     assert runner.sample_tokens(grammar_output=None) is None
 
-    assert spy.events == ["open:1", "close:1"]
-    assert runner._kv_connector_stack is None
+    assert spy.events == ["preempt:1", "open:1", "close:1"]
+    assert runner._kv_step_finished_req_ids is None
+    # Worker shutdown closes again; the step must not close twice.
+    assert runner.finish_kv_connector_step() is None
+    assert spy.events.count("close:1") == 1
 
 
 @pytest.fixture
@@ -243,18 +191,11 @@ def no_connector(monkeypatch) -> None:
     def forbidden(*args, **kwargs):
         raise AssertionError("connector touched without a KV connector")
 
+    import vllm_metal.v1.kv_connector as metal_kv_connector
+
     monkeypatch.setattr(mr, "has_kv_transfer_group", lambda: False)
     monkeypatch.setattr(mr, "get_kv_transfer_group", forbidden)
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "_get_kv_connector_output",
-        staticmethod(forbidden),
-    )
-    monkeypatch.setattr(
-        mr.KVConnectorModelRunnerMixin,
-        "kv_connector_no_forward",
-        staticmethod(forbidden),
-    )
+    monkeypatch.setattr(metal_kv_connector, "get_kv_transfer_group", forbidden)
 
 
 def test_zero_token_step_without_connector_is_unchanged(no_connector):
