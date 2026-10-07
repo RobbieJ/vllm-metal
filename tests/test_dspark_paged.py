@@ -197,6 +197,36 @@ def _check_ragged_proposals(
             assert torch.all(torch.isnan(cache.storage.tensors[name][[0, 6, 10, 11]]))
 
 
+def test_compiled_proposal_without_corrected_logits_matches_dense_ids():
+    # The serving proposer compiles with corrected_logits=False; skipping the
+    # dense -inf fill must not change which tokens the draft proposes.
+    model, cache = make_cache()
+    # Separate candidate scores so the top-k boundary stays stable in fp16.
+    model.lm_head.weight = mx.zeros((64, 64), dtype=mx.float16)
+    model.lm_head.weight[:, 0] = (mx.arange(64).astype(mx.float16) - 32) / 32
+    width, draft_topk = 7, 8
+    tables, length = [5, 2, 7, 1], 31
+    features = [mx.random.normal((1, length, 64)).astype(mx.float16) for _ in range(3)]
+    cache.write_context([f[0] for f in features], [(tables, 0, length)])
+    anchors = mx.array([11])
+    draft = cache.compile_draft(
+        num_draft_tokens=width, draft_topk=draft_topk, corrected_logits=False
+    )
+    actual = draft(anchors, [(tables, length)])
+    mx.eval(actual, *cache.storage.buffers)
+    expected = model.draft(
+        anchors, features, num_draft_tokens=width, draft_topk=draft_topk
+    )
+    assert actual[1] is None
+    np.testing.assert_array_equal(np.array(actual[0]), np.array(expected[0]))
+    np.testing.assert_allclose(
+        np.array(actual[2].astype(mx.float32)),
+        np.array(expected[2].astype(mx.float32)),
+        atol=0.006,
+        rtol=0.006,
+    )
+
+
 def test_one_token_proposal_uses_one_lookahead_slot_at_page_boundary():
     model, cache = make_cache()
     features = [mx.random.normal((1, 15, 64)).astype(mx.float16) for _ in range(3)]
