@@ -962,14 +962,19 @@ class MetalModelRunner:
         Stays open across execute_model and sample_tokens. Must run before the
         forward, so sync loads land before attention reads.
         """
-        if self._kv_step_finished_req_ids is not None:
-            # A previous step raised between start and finish. Close it here:
-            # a step left open breaks the store-flush ordering and writes the
-            # wrong KV into the offload pool.
-            logger.error("Closing leaked KV connector step.")
-            self._close_kv_connector_step()
+        self._close_leaked_kv_connector_step()
         self._kv_connector().pre_forward(scheduler_output)
         self._kv_step_finished_req_ids = scheduler_output.finished_req_ids
+
+    def _close_leaked_kv_connector_step(self) -> None:
+        """Close a step a previous execute_model left open when it raised.
+
+        Runs before the next step handles preemptions: a step left open breaks
+        the store-flush ordering and writes the wrong KV into the offload pool.
+        """
+        if self._kv_step_finished_req_ids is not None:
+            logger.error("Closing leaked KV connector step.")
+            self._close_kv_connector_step()
 
     def _close_kv_connector_step(self) -> KVConnectorOutput | None:
         finished_req_ids = self._kv_step_finished_req_ids
@@ -3025,6 +3030,7 @@ class MetalModelRunner:
                 if runtime is not None:
                     runtime.materialize_pending_state()
                 # Handles preemptions, as pre_forward does on other steps.
+                self._close_leaked_kv_connector_step()
                 return self._kv_connector().no_forward(scheduler_output)
             # Handles preemptions before opening the step.
             self._kv_connector_start_step(scheduler_output)

@@ -146,10 +146,9 @@ def test_step_closes_before_the_next_step_handles_preemptions(spy):
 
 
 def test_zero_token_step_after_a_pipelined_step_does_not_crash(spy):
-    """A leaked context plus a zero-token step kills engine core upstream.
-
-    The no-forward path clears the connector metadata, so a later close of the
-    still-open previous context trips get_finished's metadata assertion."""
+    """A pipelined step closes at submit, so a zero-token step after it runs
+    against no open step. See the leaked-step tests below for a step that
+    was never closed."""
     runner = make_stub_runner(model=SimpleNamespace())
 
     _pipelined_decode_step(runner, spy, "1")
@@ -159,8 +158,7 @@ def test_zero_token_step_after_a_pipelined_step_does_not_crash(spy):
     spy.step = "2"
     runner.execute_model(_scheduler_output([]))
 
-    # Step 3 opens its own step. With step 1 leaked, the recovery close would
-    # run against cleared metadata and raise.
+    # Step 3 opens its own step; nothing is left open to recover.
     spy.step = "3"
     runner._kv_connector_start_step(_scheduler_output(["r0"]))
 
@@ -182,6 +180,55 @@ def test_sample_tokens_without_pending_state_closes_the_step(spy):
     # Worker shutdown closes again; the step must not close twice.
     assert runner.finish_kv_connector_step() is None
     assert spy.events.count("close:1") == 1
+
+
+def test_leaked_step_closes_before_the_next_step_handles_preemptions(spy):
+    """execute_model raised after opening step 1, so nothing closed it."""
+    runner = make_stub_runner(model=SimpleNamespace())
+    spy.step = "1"
+    runner._kv_connector_start_step(_scheduler_output(["r0"]))
+
+    spy.step = "2"
+    runner._kv_connector_start_step(_scheduler_output(["r0"]))
+
+    assert spy.events == ["preempt:1", "open:1", "close:1", "preempt:2", "open:2"]
+
+
+def test_leaked_step_closes_before_a_zero_token_step(spy):
+    """A zero-token step after a leaked one must not handle its preemptions
+    first, and must not clear the leaked step's metadata before its close."""
+    runner = make_stub_runner(model=SimpleNamespace())
+    spy.step = "1"
+    runner._kv_connector_start_step(_scheduler_output(["r0"]))
+
+    spy.step = "2"
+    runner.execute_model(_scheduler_output([]))
+    spy.step = "3"
+    runner._kv_connector_start_step(_scheduler_output(["r0"]))
+
+    assert spy.events == [
+        "preempt:1",
+        "open:1",
+        "close:1",
+        "preempt:2",
+        "open:2",
+        "close:2",
+        "preempt:3",
+        "open:3",
+    ]
+
+
+def test_each_close_tells_the_connector_the_forward_is_done(spy):
+    """finish_forward runs once per closed step."""
+    runner = make_stub_runner(model=SimpleNamespace())
+    spy.step = "1"
+    runner._kv_connector_start_step(_scheduler_output(["r0"]))
+    assert spy.finish_forward_calls == 0
+
+    runner.finish_kv_connector_step()
+    runner.finish_kv_connector_step()
+
+    assert spy.finish_forward_calls == 1
 
 
 @pytest.fixture
