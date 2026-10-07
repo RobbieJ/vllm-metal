@@ -47,6 +47,11 @@ def _kv_dtype_bytes(cache_dtype: str, model_dtype: Any) -> int:
 # loses nothing, the scheduler retries the store on the next step.
 _DEFAULT_POOL_REQUESTS = 2
 
+# Internal: set when this hook chose the pool size, so the memory planner may
+# shrink it to fit. The hook runs again in the engine core, where the size
+# alone would look user-set. Users must not set it.
+AUTO_POOL_KEY = "_metal_auto_pool"
+
 
 def default_host_pool_bytes(vllm_config: VllmConfig) -> int:
     """Host pool bytes for two ``max_model_len`` requests of KV.
@@ -177,13 +182,15 @@ def configure_kv_offloading(vllm_config: VllmConfig) -> None:
     extra = kv_transfer_config.kv_connector_extra_config
     if kv_offloading_size is not None:
         extra["cpu_bytes_to_use"] = int(kv_offloading_size * (1 << 30))
+        extra.pop(AUTO_POOL_KEY, None)  # a user-set size is never capped
         cache_config.kv_offloading_size = None
     elif "cpu_bytes_to_use" not in extra:
         extra["cpu_bytes_to_use"] = default_host_pool_bytes(vllm_config)
+        extra[AUTO_POOL_KEY] = True
         logger.info_once(
             "KV offloading on Metal: no --kv-offloading-size given, so the host "
             "pool defaults to %.2f GiB, two --max-model-len requests (%d tokens "
-            "each) of KV.",
+            "each) of KV; it may be capped to fit the budget.",
             extra["cpu_bytes_to_use"] / 2**30,
             model_config.max_model_len,
         )

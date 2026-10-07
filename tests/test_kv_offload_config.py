@@ -16,6 +16,7 @@ from vllm.config import AuxOutputConfig
 
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
+from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY  # noqa: E402
 
 _CONFIG_LOGGER = "vllm_metal.v1.kv_offload.config"
 
@@ -99,6 +100,19 @@ def _offline_platform(monkeypatch: pytest.MonkeyPatch):
     reset_config()
 
 
+def test_offloading_size_drops_a_user_set_auto_pool_marker() -> None:
+    """The marker is internal; an explicit size is never capped."""
+    vllm_config = _base_config(kv_offloading_size=2.0)
+    vllm_config.kv_transfer_config = SimpleNamespace(
+        kv_connector=None,
+        kv_connector_module_path=None,
+        kv_role=None,
+        kv_connector_extra_config={AUTO_POOL_KEY: True},
+    )
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert AUTO_POOL_KEY not in vllm_config.kv_transfer_config.kv_connector_extra_config
+
+
 def test_offloading_size_translates_to_metal_connector() -> None:
     vllm_config = _base_config(kv_offloading_size=2.0)
     MetalPlatform.check_and_update_config(vllm_config)
@@ -110,6 +124,7 @@ def test_offloading_size_translates_to_metal_connector() -> None:
     assert ktc.kv_role == "kv_both"
     extra = ktc.kv_connector_extra_config
     assert extra["cpu_bytes_to_use"] == 2 * (1 << 30)
+    assert AUTO_POOL_KEY not in extra
     # One spec serves both the plain host pool and secondary tiers.
     assert extra["spec_name"] == "MetalTieringOffloadingSpec"
     assert extra["spec_module_path"] == "vllm_metal.v1.kv_offload.spec"
@@ -501,10 +516,16 @@ def test_connector_without_size_defaults_the_pool_to_two_requests() -> None:
     assert ktc.kv_connector == "MetalOffloadingConnector"
     assert ktc.kv_role == "kv_both"
     # 2 * layers * kv_heads * head_size * float16 bytes, for two 4096-token requests.
-    assert (
-        ktc.kv_connector_extra_config["cpu_bytes_to_use"]
-        == 2 * 36 * 8 * 128 * 2 * 4096 * 2
-    )
+    expected = 2 * 36 * 8 * 128 * 2 * 4096 * 2
+    extra = ktc.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == expected
+    # Marked so the memory planner may cap it to the budget.
+    assert extra[AUTO_POOL_KEY] is True
+
+    # The engine core runs the hook again; size and marker survive.
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert extra["cpu_bytes_to_use"] == expected
+    assert extra[AUTO_POOL_KEY] is True
 
 
 def test_default_pool_rounds_the_request_up_to_whole_blocks() -> None:
@@ -526,10 +547,10 @@ def test_explicit_pool_bytes_in_the_connector_config_are_kept() -> None:
 
     MetalPlatform.check_and_update_config(vllm_config)
 
-    assert (
-        vllm_config.kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"]
-        == 123
-    )
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == 123
+    # A user-set size is never capped.
+    assert AUTO_POOL_KEY not in extra
 
 
 @pytest.mark.parametrize(
