@@ -202,7 +202,8 @@ class DSparkModel(nn.Module):
         anchors: mx.array,
         *,
         draft_topk: int | None = None,
-    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        corrected_logits: bool = True,
+    ) -> tuple[mx.array, mx.array | None, mx.array | None]:
         """Return token IDs, corrected logits, and optional raw confidence logits.
 
         Each correction and confidence prediction uses the preceding token:
@@ -212,6 +213,10 @@ class DSparkModel(nn.Module):
         With draft_topk, only the top base-logit candidates receive Markov
         corrections; all other corrected logits are -inf. This approximates
         the proposal, never the target's verification distribution.
+
+        ``corrected_logits=False`` skips building the dense per-position
+        logits tensor (a full-vocabulary -inf fill per draft position) and
+        returns ``None`` in its place — for callers that only need the IDs.
         """
         self.backbone.validate_anchor_metadata(anchors)
         self.backbone.validate_embeddings(hidden, 0)
@@ -247,14 +252,19 @@ class DSparkModel(nn.Module):
                 previous = mx.take_along_axis(indices[:, i], choice, axis=-1).squeeze(
                     -1
                 )
-                step_logits = mx.put_along_axis(
-                    mx.full_like(logits[:, i], -float("inf")),
-                    indices[:, i],
-                    candidate_logits,
-                    axis=-1,
+                step_logits = (
+                    mx.put_along_axis(
+                        mx.full_like(logits[:, i], -float("inf")),
+                        indices[:, i],
+                        candidate_logits,
+                        axis=-1,
+                    )
+                    if corrected_logits
+                    else None
                 )
             tokens.append(previous)
-            corrected.append(step_logits)
+            if corrected_logits:
+                corrected.append(step_logits)
         confidence = None
         if self.confidence_head is not None:
             inputs = hidden
@@ -267,7 +277,11 @@ class DSparkModel(nn.Module):
                     axis=-1,
                 )
             confidence = self.confidence_head(inputs)
-        return mx.stack(tokens, axis=1), mx.stack(corrected, axis=1), confidence
+        return (
+            mx.stack(tokens, axis=1),
+            mx.stack(corrected, axis=1) if corrected_logits else None,
+            confidence,
+        )
 
     def draft(
         self,
@@ -276,9 +290,15 @@ class DSparkModel(nn.Module):
         *,
         num_draft_tokens: int,
         draft_topk: int | None = None,
-    ) -> tuple[mx.array, mx.array, mx.array | None]:
+        corrected_logits: bool = True,
+    ) -> tuple[mx.array, mx.array | None, mx.array | None]:
         hidden = self.block_hidden(anchors, features, num_draft_tokens=num_draft_tokens)
-        return self.greedy_proposal(hidden, anchors, draft_topk=draft_topk)
+        return self.greedy_proposal(
+            hidden,
+            anchors,
+            draft_topk=draft_topk,
+            corrected_logits=corrected_logits,
+        )
 
     @staticmethod
     def validate_draft_topk(draft_topk: int | None, vocab_size: int) -> None:

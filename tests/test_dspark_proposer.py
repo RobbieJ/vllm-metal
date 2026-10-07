@@ -206,10 +206,14 @@ def test_profile_materializes_dspark_owned_heads(monkeypatch, confidence, draft_
     draft = model.draft
     observed = []
 
-    def record(anchors, features, *, num_draft_tokens, draft_topk):
+    def record(anchors, features, *, num_draft_tokens, draft_topk, corrected_logits):
         observed.append((anchors.shape, num_draft_tokens, draft_topk))
         return draft(
-            anchors, features, num_draft_tokens=num_draft_tokens, draft_topk=draft_topk
+            anchors,
+            features,
+            num_draft_tokens=num_draft_tokens,
+            draft_topk=draft_topk,
+            corrected_logits=corrected_logits,
         )
 
     monkeypatch.setattr(model, "draft", record)
