@@ -37,15 +37,19 @@ Keys for an `fs` tier:
 Without `--kv-offloading-size`, the pool defaults to the KV of two
 `--max-model-len` requests, rounded up to whole blocks. A full pool does not lose
 a block, the scheduler retries the store on the next step; two requests is the
-smallest pool with no retries at concurrency 4 in the #1037 measurements. Pass
-the flag to size it yourself.
+smallest pool with no retries at concurrency 4 in the #1037 measurements. The
+default is capped so the KV cache keeps at least three quarters of its budget
+(what is left after the weights and activation overhead) and room for one
+`--max-model-len` request. The startup log says when it is capped. Pass the
+flag to size it yourself.
 
 The host pool comes out of `--gpu-memory-utilization` (see
 [Configuration](configuration.md#kv-cache-memory-settings)), which is the total
 Metal budget including weights. A larger pool means a smaller KV cache, not
 extra memory. The startup memory breakdown shows it as `kv_offload_pool=`. A
-pool larger than the budget fails at startup, after the weights load, with the
-breakdown and the fix. 8 GiB was enough for the Qwen3-32B benchmark in #737.
+pool set with `--kv-offloading-size` that is larger than the budget fails at
+startup, after the weights load, with the breakdown and the fix. 8 GiB was
+enough for the Qwen3-32B benchmark in #737.
 
 ## Limits
 

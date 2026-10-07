@@ -16,6 +16,7 @@ from vllm.config import AuxOutputConfig
 
 from vllm_metal.config import reset_config
 from vllm_metal.platform import MetalPlatform
+from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY  # noqa: E402
 
 _CONFIG_LOGGER = "vllm_metal.v1.kv_offload.config"
 
@@ -109,6 +110,7 @@ def test_offloading_size_translates_to_metal_connector() -> None:
     assert ktc.kv_role == "kv_both"
     extra = ktc.kv_connector_extra_config
     assert extra["cpu_bytes_to_use"] == 2 * (1 << 30)
+    assert AUTO_POOL_KEY not in extra
     # One spec serves both the plain host pool and secondary tiers.
     assert extra["spec_name"] == "MetalTieringOffloadingSpec"
     assert extra["spec_module_path"] == "vllm_metal.v1.kv_offload.spec"
@@ -470,10 +472,16 @@ def test_connector_without_size_defaults_the_pool_to_two_requests() -> None:
     assert ktc.kv_connector == "MetalOffloadingConnector"
     assert ktc.kv_role == "kv_both"
     # 2 * layers * kv_heads * head_size * float16 bytes, for two 4096-token requests.
-    assert (
-        ktc.kv_connector_extra_config["cpu_bytes_to_use"]
-        == 2 * 36 * 8 * 128 * 2 * 4096 * 2
-    )
+    expected = 2 * 36 * 8 * 128 * 2 * 4096 * 2
+    extra = ktc.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == expected
+    # Marked so the memory planner may cap it to the budget.
+    assert extra[AUTO_POOL_KEY] is True
+
+    # The engine core runs the hook again; size and marker survive.
+    MetalPlatform.check_and_update_config(vllm_config)
+    assert extra["cpu_bytes_to_use"] == expected
+    assert extra[AUTO_POOL_KEY] is True
 
 
 def test_default_pool_rounds_the_request_up_to_whole_blocks() -> None:
@@ -495,10 +503,10 @@ def test_explicit_pool_bytes_in_the_connector_config_are_kept() -> None:
 
     MetalPlatform.check_and_update_config(vllm_config)
 
-    assert (
-        vllm_config.kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"]
-        == 123
-    )
+    extra = vllm_config.kv_transfer_config.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == 123
+    # A user-set size is never capped.
+    assert AUTO_POOL_KEY not in extra
 
 
 @pytest.mark.parametrize(

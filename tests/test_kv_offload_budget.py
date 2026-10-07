@@ -25,7 +25,9 @@ _PER_BLOCK = 1_000_000
 _POOL = 2 * _GB
 
 
-def _planner(kv_transfer_config: object) -> WorkerCachePlanner:
+def _planner(
+    kv_transfer_config: object, max_model_len: int = 4096
+) -> WorkerCachePlanner:
     runner = SimpleNamespace(
         scheduler_memory_reporting_mode=lambda: "paged_attention_layout_budget",
         profile_run=lambda: _GB,
@@ -36,7 +38,9 @@ def _planner(kv_transfer_config: object) -> WorkerCachePlanner:
         block_size=16, gpu_memory_utilization=0.5, num_gpu_blocks_override=None
     )
     worker.vllm_config = SimpleNamespace(
-        cache_config=worker.cache_config, kv_transfer_config=kv_transfer_config
+        cache_config=worker.cache_config,
+        kv_transfer_config=kv_transfer_config,
+        model_config=SimpleNamespace(max_model_len=max_model_len),
     )
     worker.get_cache_block_size_bytes = MagicMock(return_value=_PER_BLOCK)
     return WorkerCachePlanner(worker)
@@ -112,6 +116,55 @@ def test_other_connector_does_not_budget() -> None:
 def test_pool_larger_than_budget_fails_with_the_mitigation() -> None:
     planner = _planner(_offload("MetalOffloadingConnector", pool=4 * _GB))
     with pytest.raises(ValueError, match="lower --kv-offloading-size"):
+        planner.determine_available_memory()
+
+
+def _auto_pool(pool: int) -> SimpleNamespace:
+    from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY
+
+    config = _offload("MetalOffloadingConnector", pool=pool)
+    config.kv_connector_extra_config[AUTO_POOL_KEY] = True
+    return config
+
+
+def test_automatic_pool_is_capped_to_fit_the_budget() -> None:
+    """A long max_model_len must not stop the server from starting."""
+    kv_transfer_config = _auto_pool(4 * _GB)
+    planner = _planner(kv_transfer_config)
+
+    # A quarter of the 3GB budget left after weights and overhead.
+    assert planner.determine_available_memory() == 3 * _GB - 750_000_000
+    # The scheduler sizes its pool from the same config after this.
+    extra = kv_transfer_config.kv_connector_extra_config
+    assert extra["cpu_bytes_to_use"] == 750_000_000
+
+
+def test_automatic_pool_under_the_cap_is_kept() -> None:
+    kv_transfer_config = _auto_pool(500_000_000)
+    plan = _planner(kv_transfer_config)._paged_attention_plan(overhead=_GB)
+    assert plan.kv_offload_pool == 500_000_000
+    assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == (
+        500_000_000
+    )
+
+
+def test_automatic_pool_leaves_room_for_one_full_request() -> None:
+    """Offloading must not stop a server that fits one request without it."""
+    kv_transfer_config = _auto_pool(4 * _GB)
+    # 2700 blocks of 1MB plus the null block: one request takes 2.701GB of
+    # the 3GB budget.
+    planner = _planner(kv_transfer_config, max_model_len=16 * 2700)
+
+    assert planner.determine_available_memory() == 2_701_000_000
+    assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == (
+        299_000_000
+    )
+
+
+def test_automatic_pool_without_room_fails_with_the_fix() -> None:
+    # One request takes the whole 3GB budget.
+    planner = _planner(_auto_pool(4 * _GB), max_model_len=16 * 3000)
+    with pytest.raises(ValueError, match="--gpu-memory-utilization"):
         planner.determine_available_memory()
 
 

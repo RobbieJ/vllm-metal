@@ -49,6 +49,7 @@ from vllm_metal.pytorch_backend.tensor_bridge import MLX_TO_TORCH_DTYPE
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES
 from vllm_metal.utils import CommitProbe, probe_commit
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
+from vllm_metal.v1.kv_offload.config import AUTO_POOL_KEY
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 if TYPE_CHECKING:
@@ -181,6 +182,11 @@ def _build_turboquant_attention_spec(
         k_quant=k_quant,
         v_quant=v_quant,
     )
+
+
+# Max share of the KV budget for an automatic host pool. See #1037: pool size
+# did not change TTFT.
+_AUTO_POOL_MAX_SHARE = 0.25
 
 
 def uses_metal_offloading(vllm_config: VllmConfig) -> bool:
@@ -1132,16 +1138,14 @@ class WorkerCachePlanner:
                     workspace / 2**20,
                 )
         usable_metal = int(metal_limit * fraction)
-        kv_offload_pool = self._kv_offload_pool_bytes()
-        kv_budget = (
-            self.base_kv_budget_bytes(
-                metal_limit,
-                model_memory,
-                fraction,
-                overhead,
-            )
-            - kv_offload_pool
+        base_kv_budget = self.base_kv_budget_bytes(
+            metal_limit,
+            model_memory,
+            fraction,
+            overhead,
         )
+        kv_offload_pool = self._resolve_kv_offload_pool(base_kv_budget, per_block_bytes)
+        kv_budget = base_kv_budget - kv_offload_pool
         return self._probe_committed_pool(
             _PagedAttentionPlan(
                 block_size=block_size,
@@ -1158,18 +1162,47 @@ class WorkerCachePlanner:
             future_reserved_bytes=future_reserved_bytes,
         )
 
-    def _kv_offload_pool_bytes(self) -> int:
+    def _resolve_kv_offload_pool(self, kv_budget: int, per_block_bytes: int) -> int:
         """Host pool bytes of the Metal offloading connector, else 0.
 
         The pool is the same physical RAM as the wired cache, so it comes out
-        of the same budget.
+        of the same budget. An automatic pool is capped so the KV cache keeps
+        at least three quarters of the budget and one full-length request.
+        Writes the capped size back to the config, which the worker's connector
+        and the scheduler read after planning.
         """
         vllm_config = self._worker.vllm_config
         if not uses_metal_offloading(vllm_config):
             return 0
         assert vllm_config.kv_transfer_config is not None
         extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-        return max(0, int(extra.get("cpu_bytes_to_use", 0)))
+        pool = max(0, int(extra.get("cpu_bytes_to_use", 0)))
+        if not extra.get(AUTO_POOL_KEY):
+            return pool
+        block_size = vllm_config.cache_config.block_size
+        # One full-length request, plus the null block vLLM's pool holds back.
+        request_blocks = -(-vllm_config.model_config.max_model_len // block_size) + 1
+        cap = min(
+            int(kv_budget * _AUTO_POOL_MAX_SHARE),
+            kv_budget - request_blocks * per_block_bytes,
+        )
+        if cap < per_block_bytes:
+            raise ValueError(
+                "KV offloading on Metal: the KV budget is too small for an "
+                "automatic host pool next to one --max-model-len request. "
+                "Raise --gpu-memory-utilization, lower --max-model-len, or set "
+                "--kv-offloading-size."
+            )
+        if pool > cap:
+            logger.info(
+                "KV offloading host pool capped from %.2f to %.2f GiB to fit "
+                "the KV budget; pass --kv-offloading-size to set it",
+                pool / 2**30,
+                cap / 2**30,
+            )
+            pool = cap
+            extra["cpu_bytes_to_use"] = pool
+        return pool
 
     def _probe_committed_pool(
         self, plan: _PagedAttentionPlan, *, future_reserved_bytes: int = 0
