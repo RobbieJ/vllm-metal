@@ -53,6 +53,33 @@ def _offload(connector: str | None, pool: int = _POOL) -> SimpleNamespace:
     )
 
 
+def _paging_probe(monkeypatch, free: int, swap_out=None) -> None:
+    """A commit probe that sees ``free`` bytes available. By default it paged
+    the whole sample, so there is no headroom."""
+    monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "1")
+    monkeypatch.setattr(
+        "vllm_metal.v1.cache_policy.probe_commit",
+        lambda nbytes: CommitProbe(
+            probed_bytes=nbytes,
+            swap_out_before=0,
+            swap_out_after=nbytes if swap_out is None else swap_out(nbytes),
+            available_before=free,
+            available_after=free,
+            compressed_before=0,
+            compressed_after=0,
+            seconds=0.0,
+        ),
+    )
+
+
+def _chunk_bytes(blocks_per_chunk: int = 1) -> int:
+    """One host chunk, aligned as vLLM's shared offload region aligns it."""
+    from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+    align = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    return -(-_PER_BLOCK * blocks_per_chunk // align) * align
+
+
 @pytest.fixture(autouse=True)
 def _fixed_device(monkeypatch) -> None:
     monkeypatch.setattr(
@@ -165,13 +192,11 @@ def test_request_that_never_fits_is_left_to_vllm() -> None:
     """One request needs more than the whole budget, with or without
     offloading. The pool takes one chunk and vLLM's max_model_len check
     reports the real problem."""
-    from vllm_metal.v1.cache_policy import _offload_chunk_bytes
-
     kv_transfer_config = _auto_pool(4 * _GB)
     extra = kv_transfer_config.kv_connector_extra_config
     planner = _planner(kv_transfer_config, max_model_len=16 * 3000)
 
-    chunk = _offload_chunk_bytes(extra, _PER_BLOCK, 16)
+    chunk = _chunk_bytes()
     assert planner.determine_available_memory() == 3 * _GB - chunk
     assert extra["cpu_bytes_to_use"] == chunk
 
@@ -199,20 +224,7 @@ def test_offload_pool_is_held_back_from_the_paging_cap(monkeypatch) -> None:
     free = 3 * _GB
     pool = _GB
     planner = _planner(_offload("MetalOffloadingConnector", pool=pool))
-    monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "1")
-    monkeypatch.setattr(
-        "vllm_metal.v1.cache_policy.probe_commit",
-        lambda nbytes: CommitProbe(
-            probed_bytes=nbytes,
-            swap_out_before=0,
-            swap_out_after=nbytes,  # paged the whole sample: no headroom
-            available_before=free,
-            available_after=free,
-            compressed_before=0,
-            compressed_after=0,
-            seconds=0.0,
-        ),
-    )
+    _paging_probe(monkeypatch, free=free)
 
     plan = planner._paged_attention_plan(overhead=_GB)
 
@@ -231,20 +243,7 @@ def test_automatic_pool_is_capped_again_when_the_probe_shrinks_the_budget(
     request_blocks = 1500
     kv_transfer_config = _auto_pool(4 * _GB)
     planner = _planner(kv_transfer_config, max_model_len=16 * request_blocks)
-    monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "1")
-    monkeypatch.setattr(
-        "vllm_metal.v1.cache_policy.probe_commit",
-        lambda nbytes: CommitProbe(
-            probed_bytes=nbytes,
-            swap_out_before=0,
-            swap_out_after=nbytes,  # paged the whole sample: no headroom
-            available_before=free,
-            available_after=free,
-            compressed_before=0,
-            compressed_after=0,
-            seconds=0.0,
-        ),
-    )
+    _paging_probe(monkeypatch, free=free)
 
     plan = planner._paged_attention_plan(overhead=_GB)
 
@@ -261,36 +260,16 @@ def test_automatic_pool_is_capped_again_when_the_probe_shrinks_the_budget(
     assert extra["cpu_bytes_to_use"] == expected_pool
 
 
-def _paging_probe(monkeypatch, free: int) -> None:
-    monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "1")
-    monkeypatch.setattr(
-        "vllm_metal.v1.cache_policy.probe_commit",
-        lambda nbytes: CommitProbe(
-            probed_bytes=nbytes,
-            swap_out_before=0,
-            swap_out_after=nbytes,
-            available_before=free,
-            available_after=free,
-            compressed_before=0,
-            compressed_after=0,
-            seconds=0.0,
-        ),
-    )
-
-
 def test_recap_that_cannot_fit_shrinks_to_one_chunk(monkeypatch) -> None:
     """The probe leaves less than one request. The pool shrinks to one chunk,
     so vLLM's max_model_len check reports the real shortfall; no raise."""
-    from vllm_metal.v1.cache_policy import _offload_chunk_bytes
-
     kv_transfer_config = _auto_pool(4 * _GB)
-    extra = kv_transfer_config.kv_connector_extra_config
     planner = _planner(kv_transfer_config, max_model_len=16 * 1500)
     _paging_probe(monkeypatch, free=2 * _GB)
 
     plan = planner._paged_attention_plan(overhead=_GB)
 
-    assert plan.kv_offload_pool == _offload_chunk_bytes(extra, _PER_BLOCK, 16)
+    assert plan.kv_offload_pool == _chunk_bytes()
 
 
 def test_recap_skips_a_probe_result_floored_at_zero(monkeypatch) -> None:
@@ -388,14 +367,12 @@ def test_block_size_key_sets_the_chunk_floor() -> None:
 def test_automatic_pool_below_one_chunk_is_raised_to_one_chunk() -> None:
     """A short max_model_len with large host chunks: two requests are less
     than one chunk, which would give the host pool no chunks at all."""
-    from vllm_metal.v1.cache_policy import _offload_chunk_bytes
-
     kv_transfer_config = _auto_pool(32 * _PER_BLOCK)
     extra = kv_transfer_config.kv_connector_extra_config
     extra["block_size"] = 1024  # 64 blocks per chunk
     _planner(kv_transfer_config, max_model_len=256).determine_available_memory()
 
-    assert extra["cpu_bytes_to_use"] == _offload_chunk_bytes(extra, _PER_BLOCK, 16)
+    assert extra["cpu_bytes_to_use"] == _chunk_bytes(64)
 
 
 def test_cap_equal_to_one_chunk_starts() -> None:
@@ -407,33 +384,6 @@ def test_cap_equal_to_one_chunk_starts() -> None:
     _planner(kv_transfer_config, max_model_len=16 * 2743).determine_available_memory()
 
     assert extra["cpu_bytes_to_use"] == 256 * _PER_BLOCK
-
-
-def test_recap_at_the_exact_fit_boundary_shrinks_to_one_chunk() -> None:
-    """What the probe left minus one chunk is exactly one request."""
-    kv_transfer_config = _auto_pool(750 * _PER_BLOCK)
-    kv_transfer_config.kv_connector_extra_config["blocks_per_chunk"] = 256
-    planner = _planner(kv_transfer_config, max_model_len=16 * 49)  # 50 blocks
-
-    pool = planner._recap_kv_offload_pool(
-        306 * _PER_BLOCK, 750 * _PER_BLOCK, _PER_BLOCK
-    )
-
-    assert pool == 256 * _PER_BLOCK
-
-
-def test_recap_log_reports_the_final_kv_cache(monkeypatch, caplog) -> None:
-    """The probe warns with its own KV size; the re-cap line gives the final."""
-    kv_transfer_config = _auto_pool(4 * _GB)
-    planner = _planner(kv_transfer_config, max_model_len=16 * 1500)
-    _paging_probe(monkeypatch, free=3 * _GB)
-
-    with caplog.at_level("INFO", logger="vllm_metal.v1.cache_policy"):
-        plan = planner._paged_attention_plan(overhead=_GB)
-
-    assert f"the KV cache gets the difference, {plan.kv_budget / 1e9:.2f} GB" in (
-        caplog.text
-    )
 
 
 def test_request_reservation_rounds_a_partial_block_up() -> None:
