@@ -1,11 +1,13 @@
 # Recipes by Mac Memory
 
-vLLM Metal runs an AI chat model on your own Mac. This page gives one tested
-setup for each memory size: 16, 32 or 64 GB. Pick yours, run one command, and
-you have a chat model that you and your apps can send questions to.
+Run a model on your own Mac for chat, coding agents and tool use. Pick your
+Mac's memory below and the rest of the page follows that choice. To see it,
+open the Apple menu, choose **About This Mac**, and look for **Memory**.
 
-To see your Mac's memory, open the Apple menu, choose **About This Mac**, and
-look for **Memory**.
+!!! note "Estimated starting points"
+    These settings were measured on 128 GB Macs with vLLM limited to the
+    memory a smaller Mac gives its graphics chip. A real Mac of that size, with
+    other apps open, may need smaller settings. Start here and adjust.
 
 ## Before you start
 
@@ -22,83 +24,118 @@ look for **Memory**.
 A **token** is the unit a model reads and writes. One token is about three
 quarters of a word.
 
-## 16 GB Mac
+## Start the server
 
-You get the Qwen3.5-9B model, with room for about 49,000 words per
-conversation.
+=== "16 GB"
 
-```bash
-vllm serve mlx-community/Qwen3.5-9B-MLX-4bit --max-model-len 65536 \
-  --max-num-batched-tokens 2048
-```
+    Qwen3.5-9B, with room for a conversation of about 49,000 words.
 
-- The first run downloads 6.0 GB.
-- `--max-model-len 65536` is the longest conversation in tokens: your
-  question and the reply together.
-- It can work on one conversation of that length at once, or two of half
-  that length.
-- `--max-num-batched-tokens 2048` makes vLLM read long text in smaller steps,
-  so it needs less memory. Without it this model does not fit on 16 GB. It
-  did not slow down replies in testing.
+    ```bash
+    vllm serve mlx-community/Qwen3.5-9B-MLX-4bit \
+      --host 127.0.0.1 --max-model-len 65536 --max-num-batched-tokens 2048 \
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+      --reasoning-parser qwen3
+    ```
 
-## 32 GB Mac
+    - The first run downloads 6.0 GB.
+    - `--max-num-batched-tokens 2048` reads long text in smaller steps, so the
+      model needs less memory. Without it this model does not fit on 16 GB.
 
-You get the larger Qwen3.5-27B model, with room for about 24,000 words per
-conversation.
+=== "32 GB"
 
-```bash
-vllm serve mlx-community/Qwen3.5-27B-4bit --max-model-len 32768 \
-  --max-num-batched-tokens 1024
-```
+    Qwen3.5-27B, a larger model, with room for a conversation of about 24,000
+    words.
 
-- The first run downloads 16 GB.
-- It can work on about one and a half conversations of that length at once.
-- It is slow to read long text: about a minute for 10,000 words on an M4 Max.
-  For faster replies, use the 16 GB recipe.
+    ```bash
+    vllm serve mlx-community/Qwen3.5-27B-4bit \
+      --host 127.0.0.1 --max-model-len 32768 --max-num-batched-tokens 1024 \
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+      --reasoning-parser qwen3
+    ```
 
-## 64 GB Mac
+    - The first run downloads 16 GB.
+    - It is slow to read long text. For faster replies, use the 16 GB recipe.
+    - `--max-num-batched-tokens 1024` reads long text in smaller steps, so the
+      model needs less memory. Without it this model does not fit on 32 GB.
 
-You get Qwen3.5-35B-A3B, with room for about 24,000 words per conversation.
+=== "64 GB"
 
-```bash
-vllm serve mlx-community/Qwen3.5-35B-A3B-4bit --max-model-len 32768
-```
+    Qwen3.5-35B-A3B, with room for many conversations of about 24,000 words
+    at once.
 
-- The first run downloads 20 GB.
-- It can work on about 20 conversations of that length at once.
-- It is the fastest of the three. Only part of the model runs for each word,
-  so it reads 10,000 words in about 12 seconds on an M4 Max.
+    ```bash
+    vllm serve mlx-community/Qwen3.5-35B-A3B-4bit \
+      --host 127.0.0.1 --max-model-len 32768 \
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+      --reasoning-parser qwen3
+    ```
+
+    - The first run downloads 20 GB.
+    - It is the fastest of the three, because only part of the model runs for
+      each word.
+
+What the options do:
+
+- `--host 127.0.0.1` keeps the server to your Mac. See
+  [Share with other computers](#share-with-other-computers) to change that.
+- `--max-model-len` is the longest conversation in tokens: your messages and
+  the replies together.
+- `--enable-auto-tool-choice --tool-call-parser qwen3_coder` lets the model
+  call tools, which coding agents and other apps need.
+- `--reasoning-parser qwen3` puts the model's thinking in a separate field, so
+  replies hold only the answer.
+
+The server is ready when Terminal shows `Application startup complete`. Leave
+that window open.
 
 ## Check that it works
 
-The server is ready when Terminal shows `Application startup complete`. Leave
-that window open. Open a second Terminal window with Command-N and paste:
+Open a second Terminal window with Command-N and paste:
 
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "mlx-community/Qwen3.5-9B-MLX-4bit",
-    "messages": [{"role": "user", "content": "What is unified memory?"}],
-    "chat_template_kwargs": {"enable_thinking": false}
-  }'
-```
+=== "16 GB"
 
-On a 32 or 64 GB Mac, change `Qwen3.5-9B-MLX-4bit` to the model in your command.
-The answer is the text after `"content"`.
+    ```bash
+    curl http://127.0.0.1:8000/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -d '{"model": "mlx-community/Qwen3.5-9B-MLX-4bit",
+           "messages": [{"role": "user", "content": "What is unified memory?"}]}'
+    ```
 
-Qwen3.5 normally thinks out loud before it answers. `"enable_thinking": false`
-turns that off, so the reply is shorter and faster. To see the thinking,
-delete that line and the comma at the end of the line above it.
+=== "32 GB"
 
-## Use it from a chat app
+    ```bash
+    curl http://127.0.0.1:8000/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -d '{"model": "mlx-community/Qwen3.5-27B-4bit",
+           "messages": [{"role": "user", "content": "What is unified memory?"}]}'
+    ```
 
-Apps that let you set an OpenAI API address, often called the base URL, can
-use the server. Set it to `http://localhost:8000/v1`. If the app asks for an
-API key, type any text.
+=== "64 GB"
 
-The server also accepts connections from other computers on your network. To
-keep it to your Mac only, add `--host 127.0.0.1` to the command.
+    ```bash
+    curl http://127.0.0.1:8000/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -d '{"model": "mlx-community/Qwen3.5-35B-A3B-4bit",
+           "messages": [{"role": "user", "content": "What is unified memory?"}]}'
+    ```
+
+The answer is the text after `"content"`. Qwen3.5 thinks before it answers,
+which can take a while. To skip the thinking for a faster reply, add
+`"chat_template_kwargs": {"enable_thinking": false}` to the request.
+
+## Use it from an app or agent
+
+Apps and coding agents that let you set an OpenAI API address, often called
+the base URL, can use the server. Set it to `http://127.0.0.1:8000/v1` and use
+the model name from your recipe. If the app asks for an API key, type any
+text.
+
+## Share with other computers
+
+To reach the server from other computers on your network, replace
+`--host 127.0.0.1` with `--host 0.0.0.0` and add `--api-key` with a secret of
+your choice, for example `--api-key my-secret`. Apps then need that key.
+Without it, anyone on your network can use the server.
 
 ## Stop the server
 
@@ -128,7 +165,7 @@ Read the error just above the last line in Terminal.
 
 [llmman](https://github.com/llmmanorg/llmman) can start the same models. On a
 Mac it uses MLX's own server by default. To use vLLM Metal, run the `source`
-step from [Before you start](#before-you-start), then:
+step from [Before you start](#before-you-start), then, for the 16 GB recipe:
 
 ```bash
 LLMMAN_SAFETENSORS_ENGINE=vllm LLMMAN_CONTEXT_LENGTH=65536 \
@@ -137,8 +174,8 @@ LLMMAN_SAFETENSORS_ENGINE=vllm LLMMAN_CONTEXT_LENGTH=65536 \
 ```
 
 `LLMMAN_CONTEXT_LENGTH` is the same as `--max-model-len` above, and
-`LLMMAN_VLLM_ARGS` passes other options to vLLM. llmman keeps
-its own copy of the model, so the first run downloads it again.
+`LLMMAN_VLLM_ARGS` passes other options to vLLM. llmman keeps its own copy of
+the model, so the first run downloads it again.
 
 ## Reuse long prompts
 
@@ -147,20 +184,25 @@ or one document asked about many times. vLLM reloads the work it already did
 on that text instead of redoing it. It works with Qwen3 models such as
 `mlx-community/Qwen3-8B-4bit`, not with the Qwen3.5 models above. It needs a
 vLLM Metal release newer than v0.30.0 or the install script's development
-build. See
-[KV Cache Offloading](kv_offloading.md).
+build. See [KV Cache Offloading](kv_offloading.md).
 
 ## How these were tested
 
 You can skip this section.
 
-Each recipe was started and sent a request with vLLM 0.31 and vLLM Metal
-main (October 2026), on a 128 GB M3 Max and a 128 GB M4 Max. Reading times
-were measured on the M4 Max with a 14,000-token prompt. The llmman command was
-run on the M4 Max with llmman 0.1.535. `--gpu-memory-utilization`
-was set to match the memory a smaller Mac gives its graphics chip, taken as
-2/3 of the Mac's memory. Measured Macs gave between 67% and 84%, so a real
-Mac of each size should have at least this much. The test Macs had plenty of
-free memory, so on a busy Mac fewer conversations fit at once.
+Each command was run as written with vLLM 0.31 and vLLM Metal main (October
+2026), on a 128 GB M3 Max and a 128 GB M4 Max. `--gpu-memory-utilization` was
+added to limit vLLM to the memory a smaller Mac gives its graphics chip, taken
+as 2/3 of the Mac's memory. Measured Macs gave between 67% and 84%. Both Macs
+gave the same results:
+
+| Recipe | KV cache | Full-length conversations at once | 14,000-token prompt (M4 Max) |
+|---|---|---|---|
+| 16 GB | 69,037 tokens | 1 | 19 s |
+| 32 GB | 47,786 tokens | 1.5 | 65 s |
+| 64 GB | 716,584 tokens | 22 | 12 s |
+
+The llmman command was run on the M4 Max with llmman 0.1.535. Tool calls were
+checked with a request that defines one function.
 
 If a recipe does not work on your Mac, please open an issue.
