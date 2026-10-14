@@ -235,59 +235,6 @@ def test_offload_pool_is_held_back_from_the_paging_cap(monkeypatch) -> None:
     assert plan.kv_budget == free - (1 << 30) - pool
 
 
-def test_automatic_pool_is_capped_again_when_the_probe_shrinks_the_budget(
-    monkeypatch,
-) -> None:
-    """On a paging machine the probe shrinks only the KV cache. The automatic
-    pool must give memory back so one request still fits."""
-    free = 3 * _GB
-    request_blocks = 1500
-    kv_transfer_config = _auto_pool(4 * _GB)
-    planner = _planner(kv_transfer_config, max_model_len=16 * request_blocks)
-    _paging_probe(monkeypatch, free=free)
-
-    plan = planner._paged_attention_plan(overhead=_GB)
-
-    # What the machine holds for KV and pool together, as the probe found it.
-    total = free - (1 << 30)
-    # One request plus vLLM's null block.
-    request = (request_blocks + 1) * _PER_BLOCK
-    expected_pool = min(total // 4, total - request)
-    assert plan.kv_offload_pool == expected_pool
-    assert plan.kv_budget == total - expected_pool
-    assert plan.num_blocks == (total - expected_pool) // _PER_BLOCK
-    assert plan.kv_budget >= request
-    # A later startup error still advises freeing memory, as #1083 does.
-    assert plan.sized_down_by_probe
-    extra = kv_transfer_config.kv_connector_extra_config
-    assert extra["cpu_bytes_to_use"] == expected_pool
-
-
-def test_recap_that_cannot_fit_says_the_machine_is_paging(monkeypatch) -> None:
-    """The probe leaves less than one request plus one chunk. The error names
-    paging, not a flag the user never set."""
-    planner = _planner(_auto_pool(4 * _GB), max_model_len=16 * 1500)
-    _paging_probe(monkeypatch, free=2 * _GB)
-
-    with pytest.raises(ValueError, match="machine is paging") as error:
-        planner._paged_attention_plan(overhead=_GB)
-    assert "--kv-offloading-size" not in str(error.value)
-
-
-def test_recap_uses_the_room_when_free_memory_is_below_the_pool(monkeypatch) -> None:
-    """With less free memory than the pool, the probe's own result floors at
-    0. The re-cap uses the room the probe saw, so the server still starts."""
-    planner = _planner(_auto_pool(4 * _GB), max_model_len=16 * 50)
-    # 100MB free past the reserve, under the 750MB pool.
-    _paging_probe(monkeypatch, free=100_000_000 + (1 << 30))
-
-    plan = planner._paged_attention_plan(overhead=_GB)
-
-    # A quarter of the 100MB room; the rest holds the 51MB request.
-    assert plan.kv_offload_pool == 25_000_000
-    assert plan.kv_budget == 75_000_000
-
-
 def test_auto_fit_max_model_len_does_not_reserve_a_full_request() -> None:
     """--max-model-len -1: vLLM fits the length after planning."""
     kv_transfer_config = _auto_pool(4 * _GB)
@@ -328,22 +275,6 @@ def test_no_budget_at_all_reports_the_breakdown(monkeypatch) -> None:
         planner.determine_available_memory()
     assert "kv_offload_pool" not in str(error.value)
     assert "--kv-offloading-size" not in str(error.value)
-
-
-def test_recap_shrinks_to_one_chunk_when_a_request_still_fits(monkeypatch) -> None:
-    """After a paging probe, a quarter of what is left can be below one chunk.
-    The pool shrinks to one chunk rather than keeping its pre-probe size."""
-    chunk = 256 * _PER_BLOCK
-    kv_transfer_config = _auto_pool(4 * _GB)
-    kv_transfer_config.kv_connector_extra_config["blocks_per_chunk"] = 256
-    planner = _planner(kv_transfer_config, max_model_len=16 * 50)
-    # The probe leaves 900MB for KV cache and pool together.
-    _paging_probe(monkeypatch, free=900_000_000 + (1 << 30))
-
-    plan = planner._paged_attention_plan(overhead=_GB)
-
-    assert plan.kv_offload_pool == chunk
-    assert plan.kv_budget == 900_000_000 - chunk
 
 
 def test_pool_below_one_aligned_chunk_fails(monkeypatch) -> None:
@@ -437,39 +368,62 @@ _MML = 16 * 100
 _REQUEST = 101 * _PER_BLOCK  # 100 blocks plus the null block
 
 
-@pytest.mark.parametrize("past_reserve", [_AUTO, 300_000_000, _REQUEST + 2_000_000])
-def test_automatic_pool_shrinks_when_free_is_at_or_below_the_pool(
-    monkeypatch, past_reserve
+@pytest.mark.parametrize(
+    ("room", "request_blocks", "blocks_per_chunk", "expected_pool"),
+    [
+        (3 * _GB - _RESERVE, 1500, 1, 3 * _GB - _RESERVE - 1501 * _PER_BLOCK),
+        (100_000_000, 50, 1, 25_000_000),
+        (_AUTO, 100, 1, _AUTO // 4),
+        (_REQUEST + 2_000_000, 100, 1, 2_000_000),
+        (900_000_000, 50, 256, 256 * _PER_BLOCK),
+        (306 * _PER_BLOCK, 49, 256, 256 * _PER_BLOCK),
+    ],
+    ids=[
+        "positive-probe-budget",
+        "below-old-pool",
+        "equal-to-old-pool",
+        "request-floor",
+        "chunk-floor",
+        "exact-fit",
+    ],
+)
+def test_automatic_pool_recovers_room_for_a_request(
+    monkeypatch, room, request_blocks, blocks_per_chunk, expected_pool
 ) -> None:
-    """Room for one request and one chunk: the pool shrinks and startup works."""
+    """Re-cap a paging-limited pool so the reported KV budget fits one request."""
     kv_transfer_config = _auto_pool(4 * _GB)
     extra = kv_transfer_config.kv_connector_extra_config
-    planner = _planner(kv_transfer_config, max_model_len=_MML)
-    _paging_probe(monkeypatch, free=_RESERVE + past_reserve)
+    extra["blocks_per_chunk"] = blocks_per_chunk
+    planner = _planner(kv_transfer_config, max_model_len=16 * request_blocks)
+    _paging_probe(monkeypatch, free=_RESERVE + room)
 
-    plan = planner._paged_attention_plan(overhead=_GB)
+    budget = planner.determine_available_memory()
 
-    assert plan.kv_budget >= _REQUEST, plan
-    assert _chunk_bytes() <= plan.kv_offload_pool < _AUTO, plan
-    assert plan.kv_budget + plan.kv_offload_pool <= past_reserve, plan
-    assert extra["cpu_bytes_to_use"] == plan.kv_offload_pool
-    assert planner.determine_available_memory() == plan.kv_budget
+    assert budget == room - expected_pool
+    assert budget >= (request_blocks + 1) * _PER_BLOCK
+    assert extra["cpu_bytes_to_use"] == expected_pool
 
 
 @pytest.mark.parametrize(
-    ("past_reserve", "without_offloading_helps"),
-    [(0, False), (50_000_000, False), (_REQUEST, True), (_REQUEST + 500_000, True)],
+    ("past_reserve", "request_blocks", "without_offloading_helps"),
+    [
+        (0, 100, False),
+        (50_000_000, 100, False),
+        (_REQUEST, 100, True),
+        (_REQUEST + 500_000, 100, True),
+        (2 * _GB - _RESERVE, 1500, False),
+    ],
 )
 def test_no_room_error_names_paging(
-    monkeypatch, past_reserve, without_offloading_helps
+    monkeypatch, past_reserve, request_blocks, without_offloading_helps
 ) -> None:
     """It never advises --kv-offloading-size. It suggests starting without
     offloading only when one request would then fit."""
-    planner = _planner(_auto_pool(4 * _GB), max_model_len=_MML)
+    planner = _planner(_auto_pool(4 * _GB), max_model_len=16 * request_blocks)
     _paging_probe(monkeypatch, free=_RESERVE + past_reserve)
 
     with pytest.raises(ValueError, match="machine is paging") as error:
-        planner._paged_attention_plan(overhead=_GB)
+        planner.determine_available_memory()
 
     message = str(error.value)
     assert "--kv-offloading-size" not in message
@@ -503,35 +457,24 @@ def test_no_paging_keeps_the_pool(monkeypatch, swap) -> None:
         swap_out=lambda n: 0 if swap == "none" else kv_swap_tolerance_bytes(n),
     )
 
-    plan = planner._paged_attention_plan(overhead=_GB)
-
-    assert plan.kv_offload_pool == _AUTO
-    assert plan.kv_budget == 3 * _GB - _AUTO
+    assert planner.determine_available_memory() == 3 * _GB - _AUTO
+    assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == _AUTO
 
 
-def test_recap_at_the_exact_fit_boundary_shrinks_to_one_chunk(monkeypatch) -> None:
-    """Room minus one chunk is exactly one request: start with that chunk."""
-    kv_transfer_config = _auto_pool(750 * _PER_BLOCK)
-    kv_transfer_config.kv_connector_extra_config["blocks_per_chunk"] = 256
-    planner = _planner(kv_transfer_config, max_model_len=16 * 49)  # 50 blocks
-    _paging_probe(monkeypatch, free=_RESERVE + 306 * _PER_BLOCK)
-
-    plan = planner._paged_attention_plan(overhead=_GB)
-
-    assert plan.kv_offload_pool == _chunk_bytes(256)
-    assert plan.kv_budget == 50 * _PER_BLOCK
-
-
-def test_auto_fit_room_of_one_chunk_recaps_to_it(monkeypatch) -> None:
-    """With no request reserved, a room of exactly one chunk holds the pool."""
-    planner = _planner(_auto_pool(4 * _GB), max_model_len=_MML)
+def test_auto_fit_with_only_one_chunk_reports_memory_pressure(monkeypatch) -> None:
+    """A re-cap with no KV room keeps the probe's advice to free memory."""
+    kv_transfer_config = _auto_pool(4 * _GB)
+    planner = _planner(kv_transfer_config, max_model_len=_MML)
     planner._worker.vllm_config.model_config.original_max_model_len = -1
     _paging_probe(monkeypatch, free=_RESERVE + _chunk_bytes())
 
-    plan = planner._paged_attention_plan(overhead=_GB)
+    with pytest.raises(ValueError, match="close other applications"):
+        planner.determine_available_memory()
 
-    assert plan.kv_offload_pool == _chunk_bytes()
-    assert plan.kv_budget == 0
+    assert (
+        kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"]
+        == _chunk_bytes()
+    )
 
 
 @pytest.mark.parametrize("past_reserve", [0, 500_000])
@@ -543,11 +486,8 @@ def test_block_override_with_no_room_still_starts(monkeypatch, past_reserve) -> 
     planner._worker.cache_config.num_gpu_blocks_override = 64
     _paging_probe(monkeypatch, free=_RESERVE + past_reserve)
 
-    planner.determine_available_memory()
-    plan = planner._paged_attention_plan(overhead=_GB)
-
-    assert plan.kv_offload_pool == _AUTO
-    assert plan.kv_budget >= 0
+    assert planner.determine_available_memory() == 0
+    assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == _AUTO
 
 
 def test_turboquant_workspace_stays_out_of_the_room(monkeypatch) -> None:
@@ -558,15 +498,16 @@ def test_turboquant_workspace_stays_out_of_the_room(monkeypatch) -> None:
         "vllm_metal.v1.cache_policy.get_config",
         lambda: SimpleNamespace(turboquant=True),
     )
-    planner = _planner(_auto_pool(4 * _GB), max_model_len=_MML)
+    kv_transfer_config = _auto_pool(4 * _GB)
+    planner = _planner(kv_transfer_config, max_model_len=_MML)
     planner._worker.model_runner.tq_prefill_workspace_bytes = workspace
     past_reserve = 300_000_000
     _paging_probe(monkeypatch, free=_RESERVE + workspace + past_reserve)
 
-    plan = planner._paged_attention_plan(overhead=_GB)
-
-    assert plan.kv_budget + plan.kv_offload_pool == past_reserve
-    assert plan.kv_offload_pool == past_reserve // 4
+    assert planner.determine_available_memory() == past_reserve * 3 // 4
+    assert kv_transfer_config.kv_connector_extra_config["cpu_bytes_to_use"] == (
+        past_reserve // 4
+    )
 
 
 _PAST = [0, 1_000_000, 50_000_000, _REQUEST, _REQUEST + 1_000_000, 187_500_000]
@@ -574,11 +515,7 @@ _PAST += [300_000_000, _AUTO - 1, _AUTO, _AUTO + 1, _GB, 3 * _GB, 4 * _GB]
 
 
 def test_recap_holds_for_every_case(monkeypatch) -> None:
-    """On a paging machine with an automatic pool: the pool never grows, it
-    stays at least one chunk, KV plus pool fits the room, the config matches
-    the plan, and startup fails only when one request and one chunk cannot
-    fit."""
-    failures = []
+    """Keep one request and one host chunk within the available budget, or fail."""
     for past, requested, mml, bpc in itertools.product(
         _PAST,
         [4 * _GB, _AUTO, 100_000_000, 1_000_000],
@@ -587,33 +524,24 @@ def test_recap_holds_for_every_case(monkeypatch) -> None:
     ):
         case = (past, requested, mml, bpc)
 
-        def config(requested=requested, bpc=bpc):
-            c = _auto_pool(requested)
-            c.kv_connector_extra_config["blocks_per_chunk"] = bpc
-            return c
-
-        monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "0")
-        before = _planner(config(), mml)._paged_attention_plan(overhead=_GB)
-
-        kv_transfer_config = config()
+        kv_transfer_config = _auto_pool(requested)
         extra = kv_transfer_config.kv_connector_extra_config
+        extra["blocks_per_chunk"] = bpc
         planner = _planner(kv_transfer_config, mml)
+        monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "0")
+        planner.determine_available_memory()
+        pool_before = extra["cpu_bytes_to_use"]
+
         _paging_probe(monkeypatch, free=_RESERVE + past)
         chunk = _chunk_bytes(bpc)
         request = (-(-mml // 16) + 1) * _PER_BLOCK
         try:
-            plan = planner._paged_attention_plan(overhead=_GB)
-        except ValueError:
-            if past >= request + chunk:
-                failures.append((case, "raised with room"))
+            budget = planner.determine_available_memory()
+        except ValueError as error:
+            assert past < request + chunk, case
+            assert "machine is paging" in str(error), case
             continue
-        ok = (
-            plan.kv_offload_pool <= before.kv_offload_pool
-            and plan.kv_offload_pool >= min(chunk, before.kv_offload_pool)
-            and extra["cpu_bytes_to_use"] == plan.kv_offload_pool
-            and max(0, plan.kv_budget) + plan.kv_offload_pool <= max(past, chunk)
-        )
-        if not ok:
-            failures.append((case, plan.kv_budget, plan.kv_offload_pool))
-
-    assert not failures, f"{len(failures)} cases: {failures[:5]}"
+        pool = extra["cpu_bytes_to_use"]
+        assert chunk <= pool <= pool_before, case
+        assert budget >= request, case
+        assert budget + pool <= min(past, 3 * _GB), case
