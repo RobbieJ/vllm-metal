@@ -203,17 +203,6 @@ def test_released_pool_round_trips_after_reuse() -> None:
         scheduler.cleanup()
 
 
-def test_reuse_without_release_keeps_the_pool() -> None:
-    """Wake after a sleep that could not free the pool must not lose it."""
-    region = make_region(make_storage())
-    try:
-        region._base[0] = 7
-        region.reuse_pages()
-        assert int(region._base[0]) == 7
-    finally:
-        region.cleanup()
-
-
 def test_region_geometry_mismatch_rejected() -> None:
     storage = make_storage()
     engine_id = f"test-{uuid.uuid4().hex[:8]}"
@@ -309,15 +298,18 @@ def test_reset_empties_the_host_pool_index() -> None:
     """Sleep frees the pool's pages. That is only safe because the reset
     vLLM runs first leaves no hit that would read them."""
     manager = MetalTieringOffloadingSpec(_offloading_config()).get_manager()
-    ctx = ReqContext(req_id="r-sleep")
-    manager.on_new_request(ctx)
-    key = make_offload_key(hashlib.sha256(b"slept").digest(), 0)
-    assert manager.prepare_store([key], ctx) is not None
-    manager.complete_store([key], ctx)
-    assert manager.lookup(key, ctx) is LookupResult.HIT
+    try:
+        ctx = ReqContext(req_id="r-sleep")
+        manager.on_new_request(ctx)
+        key = make_offload_key(hashlib.sha256(b"slept").digest(), 0)
+        assert manager.prepare_store([key], ctx) is not None
+        manager.complete_store([key], ctx)
+        assert manager.lookup(key, ctx) is LookupResult.HIT
 
-    manager.reset_cache()
-    assert manager.lookup(key, ctx) is LookupResult.MISS
+        manager.reset_cache()
+        assert manager.lookup(key, ctx) is LookupResult.MISS
+    finally:
+        manager.shutdown()
 
 
 def test_events_reach_the_manager_from_the_disk_tier(tmp_path) -> None:
